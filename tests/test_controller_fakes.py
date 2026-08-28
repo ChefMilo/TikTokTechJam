@@ -331,7 +331,7 @@ def test_scripted_generator_returns_payloads_in_supplied_order() -> None:
     script = [_hypothesis("fm"), _hypothesis("lightgbm"), _hypothesis("dcn")]
     generator = ScriptedGenerator(script)
 
-    returned = [generator.propose({}) for _ in range(3)]
+    returned = [generator.propose({}, "model") for _ in range(3)]
 
     assert returned == script
     assert [h.citation.key for h in returned] == ["fm", "lightgbm", "dcn"]
@@ -340,17 +340,17 @@ def test_scripted_generator_returns_payloads_in_supplied_order() -> None:
 
 def test_scripted_generator_raises_rather_than_cycling_when_exhausted() -> None:
     generator = ScriptedGenerator([_hypothesis("fm")])
-    generator.propose({})
+    generator.propose({}, "model")
 
     with pytest.raises(ScriptExhaustedError):
-        generator.propose({})
+        generator.propose({}, "model")
 
 
 def test_scripted_generator_records_state_cards_defensively() -> None:
     generator = ScriptedGenerator([_hypothesis("fm")])
     card = {"incumbent_primary": 0.6016, "blocked_slots": []}
 
-    generator.propose(card)
+    generator.propose(card, "model")
     card["incumbent_primary"] = 999.0  # caller mutates afterwards
 
     assert generator.state_cards[0]["incumbent_primary"] == 0.6016
@@ -610,9 +610,9 @@ def test_script_exhausted_error_is_catchable_as_the_port_exceptions():
     generator = ScriptedGenerator([])
 
     with pytest.raises(GeneratorExhausted):
-        generator.propose({})
+        generator.propose({}, "model")
     with pytest.raises(PortExhausted):
-        ScriptedGenerator([]).propose({})
+        ScriptedGenerator([]).propose({}, "model")
 
 
 def test_the_two_exhaustion_kinds_do_not_catch_each_other():
@@ -718,3 +718,105 @@ def test_scripted_gate_exhaustion_is_a_port_exception():
     assert issubclass(ScriptedGateExhausted, PortExhausted)
     assert not issubclass(ScriptedGateExhausted, GeneratorExhausted)
     assert not issubclass(ScriptedGateExhausted, RealizerExhausted)
+
+
+# ---------------------------------------------------------------------------
+# Slot-aware generators — appended. Nothing above this line is modified except
+# the mechanical addition of the now-required `target_slot` argument to
+# `propose` calls.
+# ---------------------------------------------------------------------------
+
+from controller.fakes import DisobedientGenerator
+from controller.policy import FixedOrderPolicy, UniformPolicy
+from controller.ports import PolicyPort
+
+
+def test_the_real_policies_satisfy_policy_port() -> None:
+    """They live in controller/policy.py, not here — they are components,
+    not doubles — but the port conformance check belongs with the rest of
+    the port conformance checks."""
+    assert isinstance(UniformPolicy(), PolicyPort)
+    assert isinstance(FixedOrderPolicy(SLOT_ORDER), PolicyPort)
+    assert not isinstance(FakeExecutor(), PolicyPort)
+
+
+def test_scripted_generator_honours_the_requested_slot() -> None:
+    """It returns the scripted payload with `target_slot` REPLACED, rather
+    than asserting the script guessed right. The slot is the policy's to
+    decide, so coupling every hypothesis fixture to it would make a
+    fixture mismatch look like a Controller bug."""
+    generator = ScriptedGenerator([_hypothesis("fm"), _hypothesis("lightgbm")])
+
+    first = generator.propose({}, "weighting")
+    second = generator.propose({}, "calibration")
+
+    assert first.target_slot == "weighting"
+    assert second.target_slot == "calibration"
+    # Everything the script actually controls is untouched.
+    assert first.citation.key == "fm"
+    assert second.citation.key == "lightgbm"
+    assert first.expected_gain == 0.003
+
+
+def test_scripted_generator_records_the_slots_it_was_asked_for() -> None:
+    """The assertion surface for 'the Controller passed the policy-selected
+    slot to the generator'."""
+    generator = ScriptedGenerator([_hypothesis("fm"), _hypothesis("dcn")])
+
+    generator.propose({}, "model")
+    generator.propose({}, "objective")
+
+    assert generator.requested_slots == ["model", "objective"]
+
+
+def test_scripted_generator_records_the_request_that_ran_off_the_script() -> None:
+    """Recorded before the exhaustion check, so a test can still see the
+    request that overran."""
+    generator = ScriptedGenerator([])
+
+    with pytest.raises(ScriptExhaustedError):
+        generator.propose({}, "features")
+
+    assert generator.requested_slots == ["features"]
+    assert generator.state_cards == [{}]
+
+
+def test_disobedient_generator_always_names_a_different_slot() -> None:
+    generator = DisobedientGenerator(
+        [_hypothesis("fm"), _hypothesis("dcn")], wrong_slot="calibration"
+    )
+
+    first = generator.propose({}, "model")
+    second = generator.propose({}, "features")
+
+    assert first.target_slot == "calibration"
+    assert second.target_slot == "calibration"
+    assert generator.requested_slots == ["model", "features"]
+
+
+def test_disobedient_generator_disobeys_even_when_asked_for_its_wrong_slot() -> None:
+    """Without the fallback, a policy that happened to pick `calibration`
+    would get an obedient generator under a disobedient name — the fixture
+    would pass while testing nothing."""
+    generator = DisobedientGenerator([_hypothesis("fm")], wrong_slot="calibration")
+
+    payload = generator.propose({}, "calibration")
+
+    assert payload.target_slot != "calibration"
+    assert payload.target_slot in SLOT_ORDER
+
+
+def test_disobedient_generator_inherits_the_scripted_exhaustion_behaviour() -> None:
+    """The ONLY difference between the two doubles is which slot comes
+    back, which is what makes swapping one for the other a clean A/B."""
+    assert issubclass(DisobedientGenerator, ScriptedGenerator)
+    generator = DisobedientGenerator([_hypothesis("fm")])
+    generator.propose({}, "model")
+
+    with pytest.raises(ScriptExhaustedError):
+        generator.propose({}, "model")
+
+
+def test_both_generators_still_satisfy_the_resignatured_port() -> None:
+    assert isinstance(ScriptedGenerator([]), GeneratorPort)
+    assert isinstance(DisobedientGenerator([]), GeneratorPort)

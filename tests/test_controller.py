@@ -36,10 +36,12 @@ from controller.fakes import (
     ScriptedRealizer,
     metrics_from_delta,
 )
+from controller.policy import FixedOrderPolicy, UniformPolicy
 from controller.ports import RealizerExhausted
 from controller import convergence
 from controller.state import (
     STAGE_ORDER,
+    STAGE_SLOTS,
     STATE_CARD_HISTORY,
     HistoryEntry,
     RunState,
@@ -121,12 +123,30 @@ class _ClimbingExecutor:
         )
 
 
+def _model_policy() -> FixedOrderPolicy:
+    """A policy that always selects `model`.
+
+    The default for the mechanics tests below, and a deliberate choice
+    rather than a convenience. Every hypothesis in `_script()` is about
+    `model`, and several assertions here name that slot directly (the
+    CODE_EMITTED payload, the one-slot lineage diff). Pinning the policy to
+    `model` keeps those tests measuring what they are named after - event
+    ordering, lineage, budget, convergence - instead of quietly becoming
+    tests of whichever arm a random policy happened to draw.
+
+    `model` is a member of STAGE_SLOTS for all three search stages, so this
+    never runs out of a slot to return.
+    """
+    return FixedOrderPolicy(("model",))
+
+
 def _controller(
     *,
     gate=None,
     executor=None,
     generator=None,
     realizer=None,
+    policy=None,
     journal=None,
     budget=None,
     run_id="run-test",
@@ -145,6 +165,7 @@ def _controller(
         # have to maintain a config script in lockstep with its hypothesis
         # script just to get a candidate out the other end.
         realizer=realizer if realizer is not None else DeterministicRealizer(),
+        policy=policy if policy is not None else _model_policy(),
         journal=journal,
         budget=budget,
             max_nodes_per_stage=max_nodes_per_stage,
@@ -377,6 +398,7 @@ def test_baseline_is_adopted_unconditionally_without_calling_the_gate():
         gate=ExplodingGate(),
         generator=ScriptedGenerator([]),  # exhausts right after the baseline
         realizer=DeterministicRealizer(),
+        policy=_model_policy(),
         journal=journal,
         run_id="run-baseline",
     )
@@ -556,6 +578,7 @@ def test_two_identical_runs_emit_identical_event_sequences():
             gate=AlwaysAcceptGate(),
             generator=ScriptedGenerator(_script()),
             realizer=DeterministicRealizer(),
+            policy=_model_policy(),
             journal=journal,
             run_id="run-determinism",
         ).run()
@@ -575,6 +598,7 @@ def test_different_executor_seeds_change_the_numbers_but_not_the_shape():
             gate=AlwaysAcceptGate(),
             generator=ScriptedGenerator(_script()),
             realizer=DeterministicRealizer(),
+            policy=_model_policy(),
             journal=journal,
             run_id="run-shape",
         ).run()
@@ -943,6 +967,7 @@ def test_the_baseline_alone_cannot_converge():
         gate=AlwaysAcceptGate(),
         generator=ScriptedGenerator([]),  # exhausts right after the baseline
         realizer=DeterministicRealizer(),
+        policy=_model_policy(),
         journal=journal,
         run_id="run-baseline-only",
     )
@@ -1068,3 +1093,662 @@ def test_run_start_records_the_renamed_cap():
 
     assert payload["max_nodes_per_stage"] == MAX_NODES_PER_STAGE
     assert "nodes_per_stage" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Slot selection — appended. Nothing above this line is modified except the
+# mechanical addition of `policy=` to the Controller constructions, which is
+# now a required argument.
+# ---------------------------------------------------------------------------
+
+from contracts import SLOT_ORDER, Verdict
+from controller.controller import MISPROPOSED_CONFIG_ID, UNREALIZED_CONFIG_ID
+from controller.fakes import BASELINE_SIGMA, DisobedientGenerator
+from controller.ports import PolicyContractError, PortExhausted
+from controller.state import SlotStats, slot_stats
+
+STRUCTURAL_ORDER = ("features", "weighting", "model", "objective")
+
+
+class _AlternatingGate:
+    """Accepts every other candidate, with a fixed significant delta.
+
+    Needed because the mixed-outcome fixture below has to produce accepted
+    AND rejected entries in one run: DeltaGate is all-or-nothing on
+    `accept`, and ScriptedGate would have to predict exactly how many
+    candidates survive the executor and the realizer to reach it.
+
+    delta 0.01 with a 1.96-sigma half width puts ci95 strictly above zero,
+    so the internal convergence rule never fires and the run goes the
+    distance.
+    """
+
+    def __init__(self) -> None:
+        self._n = 0
+        self.delta = 0.01
+        self._half_width = 1.96 * BASELINE_SIGMA
+
+    def compare(self, candidate, incumbent) -> Verdict:
+        self._n += 1
+        accept = self._n % 2 == 1
+        return Verdict(
+            accept=accept,
+            delta=self.delta,
+            ci95=(self.delta - self._half_width, self.delta + self._half_width),
+            backtest_delta=self.delta,
+            reason=f"_AlternatingGate: accept={accept} (test double)",
+        )
+
+
+class _BadPolicy:
+    """Returns a slot it was never offered. Models a bug in our own code."""
+
+    def __init__(self, slot: str = "data_view") -> None:
+        self.slot = slot
+
+    def select_slot(self, state_card, candidate_slots):
+        return self.slot
+
+
+def _mixed_outcome_run() -> RunState:
+    """One run containing all four outcome kinds: accepted, rejected,
+    FAILED and unrealized.
+
+    Built once and reused by the four cost assertions below so they are
+    reading the same run rather than four subtly different ones.
+    """
+
+    def fail_impl_3(config: PipelineConfig):
+        if config.slots["model"].impl == "lib/impl_3":
+            return ErrorClass.NAN_LOSS, "loss became nan at epoch 3"
+        return None
+
+    controller, _ = _controller(
+        executor=_ClimbingExecutor(fail_on=fail_impl_3),
+        gate=_AlternatingGate(),
+        realizer=_FlakyRealizer(fail_on_key="paper5"),
+    )
+    return controller.run()
+
+
+# ---------------------------------------------------------------------------
+# STAGE_SLOTS
+# ---------------------------------------------------------------------------
+
+
+def test_stage_slots_has_an_entry_for_every_stage():
+    """A stage added to the enum but forgotten here would raise KeyError
+    deep inside the first attempt that reached it. state.py also guards
+    this at import time; this is the test that says so out loud."""
+    assert set(STAGE_SLOTS) == set(Stage)
+
+
+def test_stage_slots_only_ever_names_real_slots():
+    """A typo'd slot name would pass silently into the policy and then
+    KeyError on the splice. SLOT_ORDER is the vocabulary."""
+    for stage, slots in STAGE_SLOTS.items():
+        for slot in slots:
+            assert slot in SLOT_ORDER, f"{stage.value} names unknown slot {slot!r}"
+
+
+def test_search_stages_cover_everything_the_published_baseline_ignores():
+    """The four slots where the baseline takes the default are exactly
+    where the headroom is, so both structural stages must offer all four."""
+    baseline_defaults = {"features", "weighting", "model", "objective"}
+
+    assert set(STAGE_SLOTS[Stage.STAGE_1_STRUCTURAL]) == baseline_defaults
+    assert set(STAGE_SLOTS[Stage.STAGE_2_COMBINE]) == baseline_defaults
+
+
+def test_tuning_stage_opens_every_slot_and_the_others_open_none():
+    assert set(STAGE_SLOTS[Stage.STAGE_3_TUNE]) == set(SLOT_ORDER)
+    for stage in (Stage.INIT, Stage.REPRODUCE_BASELINE, Stage.FINALIZE, Stage.DONE):
+        assert STAGE_SLOTS[stage] == (), stage
+
+
+def test_stage_slots_ordering_follows_slot_order():
+    """Order is load-bearing: it is the order the policy is handed, so a
+    policy that depends on it (FixedOrderPolicy) must behave identically
+    across runs and processes."""
+    for slots in STAGE_SLOTS.values():
+        assert list(slots) == [s for s in SLOT_ORDER if s in slots]
+
+
+# ---------------------------------------------------------------------------
+# The Controller owns slot selection now
+# ---------------------------------------------------------------------------
+
+
+def test_policy_is_required_and_has_no_default():
+    """Same reasoning as the realizer: a silent default would supply the
+    very wiring this change exists to make explicit."""
+    with pytest.raises(TypeError):
+        Controller(
+            executor=FakeExecutor(seed=0),
+            gate=AlwaysAcceptGate(),
+            generator=ScriptedGenerator(_script()),
+            realizer=DeterministicRealizer(),
+            journal=InMemoryJournal(),
+        )
+
+
+def test_controller_passes_the_policy_selected_slot_to_the_generator():
+    """THE load-bearing test for this change. The generator no longer picks
+    the slot; it is told, and what it is told is exactly what the policy
+    returned."""
+    generator = ScriptedGenerator(_script())
+    policy = FixedOrderPolicy(STRUCTURAL_ORDER)
+    controller, journal = _controller(generator=generator, policy=policy)
+
+    controller.run()
+
+    # Nine search candidates, cycling the four structural arms in order.
+    assert generator.requested_slots == [
+        "features",
+        "weighting",
+        "model",
+        "objective",
+        "features",
+        "weighting",
+        "model",
+        "objective",
+        "features",
+    ]
+    # And the slot that was requested is the slot that got realized.
+    emitted = [
+        e.payload["target_slot"]
+        for e in journal.events_of_kind(EventKind.CODE_EMITTED)
+    ]
+    assert emitted == generator.requested_slots
+
+
+def test_the_generator_never_sees_the_slot_twice_via_the_state_card():
+    """The card's top-level key set is unchanged by this PR — the slot is a
+    parameter, not a key. A second copy in the card would be a channel the
+    constraint could be honoured or ignored through with no way to tell."""
+    generator = ScriptedGenerator(_script())
+    controller, _ = _controller(generator=generator)
+
+    controller.run()
+
+    card = generator.state_cards[0]
+    assert set(card) == {
+        "run_id",
+        "stage",
+        "iteration",
+        "node",
+        "incumbent_config_id",
+        "incumbent_primary",
+        "recent_history",
+        "blocked_slots",
+        "budget_remaining",
+        "convergence",
+    }
+    assert "target_slot" not in card
+
+
+def test_the_candidate_differs_from_its_parent_in_the_selected_slot_only():
+    """Selecting a different slot must move that slot and nothing else —
+    the one-slot diff is what makes the cascading slot_hash reuse pay off."""
+    executor = _RecordingExecutor(_ClimbingExecutor())
+    controller, _ = _controller(
+        executor=executor, policy=FixedOrderPolicy(("weighting",))
+    )
+    controller.run()
+
+    baseline, first = executor.configs[0], executor.configs[1]
+    differing = [s for s in baseline.slots if baseline.slots[s] != first.slots[s]]
+
+    assert differing == ["weighting"]
+
+
+# ---------------------------------------------------------------------------
+# The generator wandered: a contract violation, logged, survived
+# ---------------------------------------------------------------------------
+
+
+def test_a_disobedient_generator_produces_a_contract_error_and_the_run_goes_on():
+    generator = DisobedientGenerator(_script(), wrong_slot="calibration")
+    controller, journal = _controller(generator=generator)
+
+    state = controller.run()
+
+    assert state.stage is Stage.DONE
+    assert state.node == TOTAL_CANDIDATES  # every mismatch still cost a node
+
+    mismatches = [
+        e
+        for e in journal.events_of_kind(EventKind.ERROR)
+        if e.payload.get("reason") == "generator_slot_mismatch"
+    ]
+    assert len(mismatches) == SEARCH_CANDIDATES
+    payload = mismatches[0].payload
+    assert payload["error_class"] == ErrorClass.CONTRACT.value
+    assert payload["requested_slot"] == "model"
+    assert payload["proposed_slot"] == "calibration"
+    assert payload["config_id"] == MISPROPOSED_CONFIG_ID
+    assert _kinds(journal)[-1] == EventKind.RUN_END.value
+
+
+def test_the_controller_does_not_obey_the_slot_the_generator_named():
+    """The whole point of the guard. A payload for the wrong slot is
+    discarded, never spliced — otherwise the LLM takes the search decision
+    back through the back door."""
+    generator = DisobedientGenerator(_script(), wrong_slot="calibration")
+    controller, journal = _controller(generator=generator)
+
+    state = controller.run()
+
+    # The incumbent is still the untouched baseline: no candidate ever got
+    # as far as being evaluated.
+    assert state.incumbent_config is not None
+    assert state.incumbent_config.slots == BASELINE_SLOTS
+    assert state.incumbent_config.slots["calibration"] == BASELINE_SLOTS["calibration"]
+    assert state.iteration == 1  # the baseline, and nothing else
+
+    kinds = _kinds(journal)
+    # Proposed nine times, realized and evaluated exactly none of them.
+    assert kinds.count(EventKind.HYPOTHESIS.value) == SEARCH_CANDIDATES
+    assert kinds.count(EventKind.CODE_EMITTED.value) == 0
+    assert kinds.count(EventKind.EVAL_START.value) == 1  # the baseline only
+
+
+def test_the_mismatch_sentinel_is_distinct_from_the_unrealized_one():
+    """Two different failures with two different owners — a prompting
+    problem and a library problem — and the log must be able to count them
+    apart."""
+    generator = DisobedientGenerator(_script(), wrong_slot="calibration")
+    controller, _ = _controller(generator=generator)
+
+    state = controller.run()
+
+    assert MISPROPOSED_CONFIG_ID != UNREALIZED_CONFIG_ID
+    sentinels = [h for h in state.history if h.config_id == MISPROPOSED_CONFIG_ID]
+    assert len(sentinels) == SEARCH_CANDIDATES
+    assert all(h.config_id != UNREALIZED_CONFIG_ID for h in sentinels)
+    # Charged to the slot the policy asked for, not the one the LLM named.
+    assert all(h.target_slot == "model" for h in sentinels)
+
+
+# ---------------------------------------------------------------------------
+# The policy misbehaved: loud, immediately
+# ---------------------------------------------------------------------------
+
+
+def test_a_policy_returning_an_unoffered_slot_raises_and_is_not_swallowed():
+    """`data_view` is not in STAGE_1_STRUCTURAL's slots. Unlike an LLM, the
+    policy is our own deterministic code, so this is a defect and must stop
+    the run rather than being logged and absorbed."""
+    controller, _ = _controller(policy=_BadPolicy("data_view"))
+
+    with pytest.raises(PolicyContractError) as excinfo:
+        controller.run()
+
+    message = str(excinfo.value)
+    assert "data_view" in message
+    assert "_BadPolicy" in message
+    assert Stage.STAGE_1_STRUCTURAL.value in message
+
+
+def test_the_policy_contract_error_is_not_catchable_as_an_exhausted_port():
+    """A handler written to shrug off an exhausted generator must not also
+    shrug off a policy bug."""
+    assert not issubclass(PolicyContractError, PortExhausted)
+    assert issubclass(PolicyContractError, RuntimeError)
+
+
+def test_a_blocked_slot_returned_by_the_policy_is_also_a_violation():
+    """The candidate set is stage slots MINUS blocked slots, so re-offering
+    a blocked arm is caught by the same check."""
+    controller, _ = _controller(policy=_BadPolicy("model"))
+    state = RunState(
+        run_id="r",
+        stage=Stage.STAGE_1_STRUCTURAL,
+        blocked_slots=frozenset({"model"}),
+    )
+
+    with pytest.raises(PolicyContractError):
+        controller._attempt(
+            state,
+            Stage.STAGE_1_STRUCTURAL,
+            controller._candidate_slots(state, Stage.STAGE_1_STRUCTURAL),
+        )
+
+
+# ---------------------------------------------------------------------------
+# blocked_slots narrow the candidate set
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_slots_are_excluded_from_the_candidate_set():
+    controller, _ = _controller()
+    state = RunState(
+        run_id="r",
+        stage=Stage.STAGE_1_STRUCTURAL,
+        blocked_slots=frozenset({"model", "features"}),
+    )
+
+    candidates = controller._candidate_slots(state, Stage.STAGE_1_STRUCTURAL)
+
+    assert candidates == ("weighting", "objective")
+    assert "model" not in candidates
+    assert "features" not in candidates
+
+
+def test_blocking_narrows_the_tuning_stage_without_touching_the_others():
+    controller, _ = _controller()
+    state = RunState(
+        run_id="r", stage=Stage.STAGE_3_TUNE, blocked_slots=frozenset({"data_view"})
+    )
+
+    assert controller._candidate_slots(state, Stage.STAGE_3_TUNE) == (
+        "features",
+        "weighting",
+        "model",
+        "objective",
+        "calibration",
+    )
+    # An unblocked state is unchanged by the filter.
+    clean = RunState(run_id="r", stage=Stage.STAGE_3_TUNE)
+    assert controller._candidate_slots(clean, Stage.STAGE_3_TUNE) == tuple(SLOT_ORDER)
+
+
+def test_a_fully_blocked_stage_ends_cleanly_without_calling_the_generator():
+    """Reached through `_run_stage` directly because nothing in the current
+    Controller calls `with_blocked_slot` yet — slot blocking arrives with
+    the repair policy. The path exists now and must be covered now, or it
+    is one refactor away from being deleted as dead code.
+    """
+    generator = ScriptedGenerator(_script())
+    controller, journal = _controller(generator=generator)
+    state = RunState(
+        run_id="run-test",
+        stage=Stage.STAGE_1_STRUCTURAL,
+        blocked_slots=frozenset(STAGE_SLOTS[Stage.STAGE_1_STRUCTURAL]),
+    )
+
+    ended, stop_reason = controller._run_stage(state, Stage.STAGE_1_STRUCTURAL)
+
+    # The stage ended; the RUN did not — a later stage has a different set.
+    assert stop_reason is None
+    assert generator.requested_slots == []  # the generator was never asked
+    assert ended.node == 0  # no candidate, so no node consumed
+    assert ended.history == ()
+
+    blocked = journal.events_of_kind(EventKind.SLOT_BLOCKED)
+    assert len(blocked) == 1
+    assert blocked[0].payload["stage"] == Stage.STAGE_1_STRUCTURAL.value
+    assert blocked[0].payload["action"] == "end_stage"
+    assert sorted(blocked[0].payload["blocked_slots"]) == sorted(
+        STAGE_SLOTS[Stage.STAGE_1_STRUCTURAL]
+    )
+
+
+def test_a_fully_blocked_stage_emits_no_hypothesis_and_does_not_crash():
+    generator = ScriptedGenerator(_script())
+    controller, journal = _controller(generator=generator)
+    state = RunState(
+        run_id="run-test",
+        stage=Stage.STAGE_2_COMBINE,
+        blocked_slots=frozenset(SLOT_ORDER),
+    )
+
+    controller._run_stage(state, Stage.STAGE_2_COMBINE)  # must not raise
+
+    kinds = _kinds(journal)
+    assert EventKind.HYPOTHESIS.value not in kinds
+    assert EventKind.EVAL_START.value not in kinds
+    assert EventKind.ERROR.value not in kinds
+
+
+# ---------------------------------------------------------------------------
+# HistoryEntry now carries the arm and its cost — for every outcome
+# ---------------------------------------------------------------------------
+
+
+def test_an_accepted_attempt_records_its_slot_and_its_cost():
+    state = _mixed_outcome_run()
+
+    accepted = [h for h in state.history if h.accepted and h.target_slot is not None]
+
+    assert accepted
+    for entry in accepted:
+        assert entry.target_slot == "model"
+        assert entry.wall_seconds == 40.0
+        assert entry.tokens == 1200
+        assert entry.gpu_seconds == 0.0
+
+
+def test_a_rejected_attempt_records_its_slot_and_its_cost():
+    state = _mixed_outcome_run()
+
+    rejected = [
+        h
+        for h in state.history
+        if not h.accepted and h.primary is not None and h.delta is not None
+    ]
+
+    assert rejected
+    for entry in rejected:
+        assert entry.target_slot == "model"
+        assert entry.wall_seconds == 40.0
+        assert entry.tokens == 1200
+
+
+def test_a_failed_attempt_records_its_slot_and_a_NON_ZERO_cost():
+    """The one that matters most. A candidate that died halfway still burned
+    what it took to get there; recording zero would teach a cost-aware
+    policy that fragile slots are cheap, which is exactly backwards."""
+    state = _mixed_outcome_run()
+
+    failed = [
+        h
+        for h in state.history
+        if h.primary is None
+        and h.config_id not in (UNREALIZED_CONFIG_ID, MISPROPOSED_CONFIG_ID)
+    ]
+
+    assert failed
+    for entry in failed:
+        assert entry.target_slot == "model"
+        assert entry.wall_seconds > 0.0
+        assert entry.tokens > 0
+        assert entry.wall_seconds == 40.0
+        assert entry.tokens == 1200
+
+
+def test_an_unrealized_attempt_records_its_slot_and_an_honest_zero_cost():
+    """Zero because it never reached the executor, not because cost was
+    dropped: the realizer's own tokens are real spend but no port reports
+    them yet."""
+    state = _mixed_outcome_run()
+
+    unrealized = [h for h in state.history if h.config_id == UNREALIZED_CONFIG_ID]
+
+    assert unrealized
+    for entry in unrealized:
+        assert entry.target_slot == "model"
+        assert entry.wall_seconds == 0.0
+        assert entry.gpu_seconds == 0.0
+        assert entry.tokens == 0
+
+
+def test_the_baseline_records_no_slot_because_no_policy_chose_it():
+    state = _mixed_outcome_run()
+
+    baseline = state.history[0]
+
+    assert baseline.target_slot is None
+    assert baseline.accepted is True
+    assert baseline.wall_seconds == 40.0  # it still cost an evaluation
+
+
+def test_the_new_history_fields_survive_the_state_card_json_hop():
+    """FLAGGED CHANGE: `recent_history` entries gained four keys. They are
+    additions, not renames, and must stay RFC-valid JSON — W4 reads them."""
+    state = _mixed_outcome_run()
+
+    card = build_state_card(state)
+
+    for entry in card["recent_history"]:
+        assert {"target_slot", "wall_seconds", "gpu_seconds", "tokens"} <= set(entry)
+        # Every key that was there before is still there, unchanged.
+        assert {"config_id", "primary", "accepted", "delta", "ci95", "significant"} <= (
+            set(entry)
+        )
+    assert json.loads(json.dumps(card, allow_nan=False)) == card
+
+
+# ---------------------------------------------------------------------------
+# slot_stats — the bookkeeping the bandit PR will consume
+# ---------------------------------------------------------------------------
+
+
+def test_slot_stats_aggregates_attempts_acceptances_and_cost_per_slot():
+    state = RunState(run_id="r", stage=Stage.STAGE_1_STRUCTURAL)
+    state = state.with_outcome(
+        "a", 0.60, True, delta=0.01, target_slot="model",
+        wall_seconds=40.0, gpu_seconds=1.0, tokens=1200,
+    )
+    state = state.with_outcome(
+        "b", 0.59, False, delta=-0.005, target_slot="model",
+        wall_seconds=20.0, gpu_seconds=0.5, tokens=800,
+    )
+    state = state.with_outcome(
+        "c", None, False, target_slot="model",
+        wall_seconds=5.0, tokens=100,  # a failure: no delta, real cost
+    )
+    state = state.with_outcome(
+        "d", 0.61, True, delta=0.02, target_slot="weighting",
+        wall_seconds=10.0, tokens=300,
+    )
+
+    stats = slot_stats(state)
+
+    assert set(stats) == {"model", "weighting"}
+    assert stats["model"] == SlotStats(
+        attempts=3,
+        accepted=1,
+        total_tokens=2100,
+        total_wall_seconds=65.0,
+        deltas=(0.01, -0.005),  # the failure contributes no delta
+    )
+    assert stats["weighting"] == SlotStats(
+        attempts=1, accepted=1, total_tokens=300, total_wall_seconds=10.0,
+        deltas=(0.02,),
+    )
+
+
+def test_slot_stats_skips_the_baseline_because_no_policy_chose_it():
+    state = RunState(run_id="r", stage=Stage.REPRODUCE_BASELINE)
+    state = state.with_outcome("base", 0.6016, True, wall_seconds=40.0, tokens=1200)
+
+    assert slot_stats(state) == {}
+
+
+def test_slot_stats_omits_untried_slots_entirely():
+    """An absent key means 'no data'. A zero-filled entry would erase the
+    difference between an untried arm and one tried once to no effect."""
+    state = RunState(run_id="r", stage=Stage.STAGE_1_STRUCTURAL)
+    state = state.with_outcome("a", 0.6, False, target_slot="model")
+
+    stats = slot_stats(state)
+
+    assert set(stats) == {"model"}
+    assert "features" not in stats
+    assert "calibration" not in stats
+
+
+def test_slot_stats_is_a_pure_function_of_history():
+    state = _mixed_outcome_run()
+    history_before = state.history
+
+    first = slot_stats(state)
+    second = slot_stats(state)
+
+    assert first == second
+    assert state.history == history_before  # nothing mutated
+    assert first is not second  # a fresh fold, not a cached object
+
+
+def test_slot_stats_over_a_real_run_reconciles_with_the_history():
+    """Cross-check against the raw history, so a future refactor of the
+    fold cannot drift from what it is folding."""
+    state = _mixed_outcome_run()
+
+    stats = slot_stats(state)
+    attempted = [h for h in state.history if h.target_slot is not None]
+
+    assert sum(s.attempts for s in stats.values()) == len(attempted)
+    assert sum(s.accepted for s in stats.values()) == sum(
+        1 for h in attempted if h.accepted
+    )
+    assert sum(s.total_tokens for s in stats.values()) == sum(
+        h.tokens for h in attempted
+    )
+    assert stats["model"].attempts == SEARCH_CANDIDATES
+
+
+def test_slot_stats_attributes_cost_across_several_arms_in_one_run():
+    """The shape the bandit reads: distinct arms, each with its own cost and
+    hit count, from a run where the policy actually moved between them."""
+    controller, _ = _controller(policy=FixedOrderPolicy(STRUCTURAL_ORDER))
+
+    state = controller.run()
+    stats = slot_stats(state)
+
+    assert set(stats) == set(STRUCTURAL_ORDER)
+    # Nine candidates over four arms, cycled: 3/2/2/2.
+    assert stats["features"].attempts == 3
+    assert stats["weighting"].attempts == 2
+    assert all(s.total_tokens > 0 for s in stats.values())
+    assert all(s.total_wall_seconds > 0 for s in stats.values())
+
+
+# ---------------------------------------------------------------------------
+# Nothing else changed
+# ---------------------------------------------------------------------------
+
+
+def test_the_full_run_still_completes_exactly_as_before():
+    """Existing behaviour is unchanged apart from who picks the slot: same
+    stages, same candidate count, same terminal event."""
+    controller, journal = _controller()
+
+    state = controller.run()
+
+    assert state.stage is Stage.DONE
+    assert state.node == TOTAL_CANDIDATES
+    assert _kinds(journal)[-1] == EventKind.RUN_END.value
+    assert journal.events_of_kind(EventKind.RUN_END)[0].payload["stop_reason"] == (
+        "stages_complete"
+    )
+    assert journal.events_of_kind(EventKind.SLOT_BLOCKED) == ()
+
+
+def test_a_run_driven_by_a_seeded_uniform_policy_is_reproducible():
+    """The ablation arm, end to end. Two runs of the same seeded policy must
+    attack the same slots in the same order, or a comparison against the
+    bandit measures run-to-run variance instead of the policy."""
+
+    def slots_of_a_run(seed: int) -> list[str]:
+        generator = ScriptedGenerator(_script())
+        controller, _ = _controller(
+            generator=generator, policy=UniformPolicy(seed=seed)
+        )
+        controller.run()
+        return list(generator.requested_slots)
+
+    assert slots_of_a_run(4) == slots_of_a_run(4)
+    assert len(slots_of_a_run(4)) == SEARCH_CANDIDATES
+    assert set(slots_of_a_run(4)) <= set(SLOT_ORDER)
+
+
+def test_a_uniform_policy_run_still_reaches_done():
+    controller, journal = _controller(policy=UniformPolicy(seed=2))
+
+    state = controller.run()
+
+    assert state.stage is Stage.DONE
+    assert state.node == TOTAL_CANDIDATES
+    assert _kinds(journal)[-1] == EventKind.RUN_END.value

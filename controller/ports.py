@@ -51,6 +51,7 @@ from contracts import (
     JournalEvent,
     PipelineConfig,
     SlotConfig,
+    SlotName,
     Verdict,
 )
 
@@ -60,6 +61,8 @@ __all__ = [
     "GeneratorExhausted",
     "GeneratorPort",
     "JournalPort",
+    "PolicyContractError",
+    "PolicyPort",
     "PortExhausted",
     "RealizerExhausted",
     "RealizerPort",
@@ -112,6 +115,31 @@ class RealizerExhausted(PortExhausted):
     realised is a localized failure, and absorbing exactly that is what
     the architecture is for - so the Controller logs it, counts the node
     and moves on to the next candidate.
+    """
+
+
+class PolicyContractError(RuntimeError):
+    """A PolicyPort implementation returned a slot it was not offered.
+
+    Deliberately NOT a PortExhausted. Every exception above means "a
+    collaborator has nothing left to give", which is a runtime condition
+    the Controller absorbs. This one means "our own code is wrong", and
+    the two must not be catchable as one thing: a handler written to
+    shrug off an exhausted generator must not also shrug off a policy bug.
+
+    WHY THIS IS FATAL WHILE A MISBEHAVING GENERATOR IS NOT. The generator
+    has an LLM behind it. An LLM that ignores an instruction is an
+    expected operating condition, so the Controller logs it, discards the
+    candidate and carries on. A policy is ordinary deterministic code we
+    wrote; if it returns a slot outside `candidate_slots` there is a bug
+    in the search policy itself, and every subsequent number the run
+    produces would be attributed to the wrong arm. Failing loudly at the
+    point of the bug beats producing a plausible-looking run built on it.
+
+    Raised BY the Controller ABOUT a policy, rather than by the policy
+    itself - but it is documented here because it is part of PolicyPort's
+    contract, and an implementor reading this file needs to know that
+    breaking that contract stops the run.
     """
 
 
@@ -171,11 +199,107 @@ class GatePort(Protocol):
 
 
 @runtime_checkable
-class GeneratorPort(Protocol):
-    """Proposes the next thing to try (W4). One of only two LLM calls."""
+class PolicyPort(Protocol):
+    """Chooses WHICH SLOT the next candidate attacks. The search policy.
 
-    def propose(self, state_card: Mapping[str, Any]) -> HypothesisPayload:
-        """Given a compact summary of the run so far, propose one change.
+    WHY THIS IS A SEAM OF ITS OWN, AND WHY IT IS OURS AND NOT W4's
+    --------------------------------------------------------------
+    Picking the slot is a search decision - an explore/exploit tradeoff
+    over arms whose costs and payoffs the Controller is the only component
+    that can measure. It used to sit with the generator by default: the
+    Controller asked for a hypothesis, read `payload.target_slot` back and
+    spliced into whatever the LLM had named. That handed the search policy
+    to a model that cannot see the budget, cannot see which slots have
+    already failed, and has no memory of what it tried last time.
+
+    The generator's job is to propose a *method* and cite it; deciding
+    where in the pipeline to spend the next evaluation is ours.
+
+    IMPLEMENTATIONS LIVE IN controller/policy.py, NOT IN fakes.py.
+    UniformPolicy and FixedOrderPolicy are real components - the first is
+    the ablation baseline the cost-aware bandit will be measured against,
+    the second is the no-randomness default. Neither is a test double.
+
+    DETERMINISM IS PART OF THE CONTRACT
+    -----------------------------------
+    An implementation must be deterministic given its own seed and its own
+    call history, and must draw randomness from an instance-owned
+    `random.Random` rather than the global `random` module. Search
+    behaviour has to be reproducible: an ablation that compares two
+    policies is meaningless if replaying either one produces a different
+    sequence of arms, and a global RNG makes the sequence depend on
+    whatever else in the process happened to draw from it.
+    """
+
+    def select_slot(
+        self, state_card: Mapping[str, Any], candidate_slots: Sequence[SlotName]
+    ) -> SlotName:
+        """Pick one slot from `candidate_slots` for this attempt.
+
+        MUST return a member of `candidate_slots`. That set is already
+        filtered - it is this stage's permitted slots minus the ones the
+        run has blocked - so anything outside it is either a stage
+        violation or a re-attempt on a slot known to be broken. The
+        Controller validates the return value and raises
+        `PolicyContractError` on a miss rather than trusting it; see that
+        exception for why this one is fatal when a misbehaving generator
+        is not.
+
+        `candidate_slots` is never empty. The Controller ends the stage
+        before calling a policy with nothing to choose from, so an
+        implementation does not have to invent an answer for that case.
+
+        `state_card` is a Mapping rather than a dict for the same reason it
+        is one on GeneratorPort.propose: it is a read-only view of the
+        Controller's state, and a collaborator has no business mutating it
+        on the way past. It is the SAME card object the generator receives
+        for this attempt, so a policy and a generator can never disagree
+        about what the run looked like when the slot was chosen.
+        """
+        ...
+
+
+@runtime_checkable
+class GeneratorPort(Protocol):
+    """Proposes the next thing to try (W4). One of only two LLM calls.
+
+    IMPLEMENTED BY W4, AND methods/ IS CURRENTLY EMPTY. That is precisely
+    why `propose` is being resignatured now: today the change costs one
+    edit to this file and one to a test double, and every week it waits it
+    costs a coordination round with another workstream instead. A seam is
+    cheapest to move before anyone stands on it.
+    """
+
+    def propose(
+        self, state_card: Mapping[str, Any], target_slot: SlotName
+    ) -> HypothesisPayload:
+        """Propose one change to `target_slot`, given the run so far.
+
+        WHY THE SLOT IS A PARAMETER AND NOT A KEY IN THE STATE CARD
+        ----------------------------------------------------------
+        Both would "tell" the generator which slot to work on, and that is
+        where the resemblance ends. A directive buried in a dict is a
+        suggestion: it relies on the model noticing the key, understanding
+        it as binding, and choosing to honour it - and when it does not,
+        nothing anywhere surfaces that. The run simply proceeds, attacking
+        a slot the search policy did not pick, and the cost of that
+        evaluation is attributed to the wrong arm for the rest of the run.
+        That is a silent failure, and a silent failure inside a search loop
+        is the worst kind: it degrades results without producing a symptom.
+
+        As a parameter it is an argument at a call site. It is visible in a
+        stack trace, it is checkable against what came back, and a static
+        checker can see it. The constraint stops being something we hope
+        for and becomes something we assert.
+
+        THE RETURNED PAYLOAD'S `target_slot` MUST EQUAL `target_slot`.
+        The Controller compares them and treats a mismatch as a contract
+        violation: it logs an ERROR classified `ErrorClass.CONTRACT`,
+        counts the node and moves to the next candidate. It does NOT obey
+        the payload's choice. An LLM that wandered off the requested slot
+        has produced a hypothesis about something nobody asked about, and
+        splicing it in would let the model quietly take back the search
+        decision this parameter exists to remove from it.
 
         `state_card` is a Mapping rather than a concrete dict so the
         Controller can hand over a read-only view: the generator is the

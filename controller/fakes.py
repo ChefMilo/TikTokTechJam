@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import replace
 from typing import Any, Callable, Optional
 
 from contracts import (
@@ -28,7 +29,9 @@ from contracts import (
     JournalEvent,
     Metrics,
     PipelineConfig,
+    SLOT_ORDER,
     SlotConfig,
+    SlotName,
     Status,
     Verdict,
 )
@@ -48,6 +51,7 @@ __all__ = [
     "AlwaysRejectGate",
     "DeltaGate",
     "DeterministicRealizer",
+    "DisobedientGenerator",
     "FakeExecutor",
     "FailureHook",
     "InMemoryJournal",
@@ -300,6 +304,33 @@ class ScriptedGenerator:
     surrounding generator is converted to an opaque RuntimeError, which
     would turn a clear "your script was too short" into a confusing
     traceback far from the cause.
+
+    HONOURING THE REQUESTED SLOT
+    ----------------------------
+    `propose` returns the next scripted payload with its `target_slot`
+    REPLACED by the slot the Controller asked for. It does not assert that
+    the two already match, and it does not return the script's slot
+    unchanged.
+
+    Why replace rather than assert: the slot is no longer the script's to
+    decide. It is chosen by the policy, which is a separate collaborator a
+    test may swap out, so requiring the script to predict it would couple
+    every hypothesis fixture to whatever policy that test happens to wire
+    in - and an off-by-one between the two would surface as a mysterious
+    Controller failure rather than as a test bug. What the script still
+    controls is what actually varies between hypotheses: the rationale, the
+    citation and the forecasts. What is being proposed stays scripted; the
+    Controller decides where.
+
+    Why replace rather than return the script's slot unchanged: doing that
+    would make this double a permanently disobedient generator, so every
+    test that used it would exercise the contract-violation path and
+    nothing would ever reach the executor. Obeying is the normal case and
+    this is the normal double.
+
+    The mismatch path gets its own double - DisobedientGenerator - so both
+    sides are exercised by an explicit fixture rather than by a flag on
+    this one.
     """
 
     def __init__(self, script: Sequence[HypothesisPayload]) -> None:
@@ -308,9 +339,23 @@ class ScriptedGenerator:
         self.state_cards: list[dict[str, Any]] = []
         """A copy of every state_card handed in, so a test can assert on
         what the Controller believed about the run when it asked."""
+        self.requested_slots: list[SlotName] = []
+        """Every slot the Controller asked for, in order.
 
-    def propose(self, state_card: Mapping[str, Any]) -> HypothesisPayload:
+        The assertion surface for "the Controller passed the
+        policy-selected slot to the generator". Recorded as what was
+        REQUESTED, not what was returned, because after the replacement
+        above the two are equal by construction and only the request says
+        anything about what the Controller did.
+        """
+
+    def propose(
+        self, state_card: Mapping[str, Any], target_slot: SlotName
+    ) -> HypothesisPayload:
+        # Recorded before the exhaustion check, so a test can still see the
+        # request that ran off the end of the script.
         self.state_cards.append(dict(state_card))
+        self.requested_slots.append(target_slot)
         if self._index >= len(self._script):
             raise ScriptExhaustedError(
                 f"ScriptedGenerator exhausted after {len(self._script)} "
@@ -318,12 +363,63 @@ class ScriptedGenerator:
             )
         payload = self._script[self._index]
         self._index += 1
-        return payload
+        return replace(payload, target_slot=target_slot)
 
     @property
     def remaining(self) -> int:
         """Hypotheses left in the script."""
         return len(self._script) - self._index
+
+
+class DisobedientGenerator(ScriptedGenerator):
+    """Always proposes a slot OTHER than the one it was asked for.
+
+    The double for the contract-violation path, and it models a real
+    failure rather than an imaginary one. The generator is the component
+    with an LLM behind it, and an LLM handed an instruction can ignore it -
+    it can latch onto something in the state card, decide a different slot
+    is more promising, or simply lose the constraint in a long prompt. That
+    is an expected operating condition, not a hypothetical, which is why
+    the Controller has a deterministic check for it rather than a comment
+    asking W4 to be careful.
+
+    Without a double that does this, the guard in Controller._attempt is
+    unreachable from any test, and an unreachable guard is one refactor
+    away from being deleted as dead code.
+
+    Inherits ScriptedGenerator so exhaustion, state-card recording and
+    slot recording behave identically - the ONLY difference between the two
+    is which slot comes back, which is what makes a test that swaps one for
+    the other a clean A/B of the mismatch path.
+    """
+
+    def __init__(
+        self,
+        script: Sequence[HypothesisPayload],
+        wrong_slot: SlotName = "calibration",
+    ) -> None:
+        super().__init__(script)
+        self.wrong_slot = wrong_slot
+
+    def propose(
+        self, state_card: Mapping[str, Any], target_slot: SlotName
+    ) -> HypothesisPayload:
+        payload = super().propose(state_card, target_slot)
+        return replace(payload, target_slot=self._disobey(target_slot))
+
+    def _disobey(self, target_slot: SlotName) -> SlotName:
+        """A slot guaranteed to differ from `target_slot`.
+
+        Falls back to the first other slot in SLOT_ORDER when the
+        configured `wrong_slot` happens to be the one requested. Without
+        that, a test whose policy picked `calibration` would get an
+        obedient generator under a disobedient name and would pass while
+        testing nothing - the worst possible outcome for a fixture whose
+        entire job is to break the contract.
+        """
+        if self.wrong_slot != target_slot:
+            return self.wrong_slot
+        return next(slot for slot in SLOT_ORDER if slot != target_slot)
 
 
 # ---------------------------------------------------------------------------

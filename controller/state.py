@@ -45,18 +45,22 @@ from contracts import (
     BUDGET_COUNTER_ORDER,
     CandidateResult,
     PipelineConfig,
+    SLOT_ORDER,
     SlotName,
 )
 from controller import convergence
 
 __all__ = [
-    "STAGE_CARD_HISTORY",
     "STAGE_ORDER",
+    "STAGE_SLOTS",
+    "STATE_CARD_HISTORY",
     "HistoryEntry",
     "RunState",
+    "SlotStats",
     "Stage",
     "build_state_card",
     "next_stage",
+    "slot_stats",
 ]
 
 
@@ -113,6 +117,95 @@ def next_stage(current: Stage) -> Optional[Stage]:
     return _PROGRESSION[index + 1]
 
 
+_STRUCTURAL_SLOTS: tuple[SlotName, ...] = (
+    "features",
+    "weighting",
+    "model",
+    "objective",
+)
+"""The four slots the organizers' published FM baseline leaves on the table.
+
+It consumes five raw categorical fields with no engineered features
+("features"), weights every interaction equally ("weighting"), fits a
+factorization machine ("model"), and optimizes plain logloss
+("objective"). Those are the four places a genuinely different method can
+go, and the baseline sits ~30% of the way to the oracle ceiling largely
+because it takes the default in each of them.
+
+`data_view` and `calibration` are deliberately absent from the structural
+stages: the first fixes what data is even in scope (changing it mid-search
+would make earlier candidates incomparable), and the second is a monotone
+post-hoc transform - a refinement of a good model, not a route to one.
+Both are still reachable in STAGE_3_TUNE.
+"""
+
+
+STAGE_SLOTS: dict[Stage, tuple[SlotName, ...]] = {
+    Stage.INIT: (),
+    Stage.REPRODUCE_BASELINE: (),
+    Stage.STAGE_1_STRUCTURAL: _STRUCTURAL_SLOTS,
+    # The same four. STAGE_2_COMBINE does not open new ground; it
+    # recombines structural changes that were accepted in stage one, so
+    # its arms are exactly stage one's arms.
+    Stage.STAGE_2_COMBINE: _STRUCTURAL_SLOTS,
+    # Everything. Tuning applies anywhere - there are hyperparameters in
+    # the data view and the calibrator as much as in the model - so the
+    # last stage is the only one with no structural restriction.
+    Stage.STAGE_3_TUNE: tuple(SLOT_ORDER),
+    Stage.FINALIZE: (),
+    Stage.DONE: (),
+}
+"""Which slots each stage is allowed to attack. Empty means "proposes nothing".
+
+WHY THE STAGE CONSTRAINS THE POLICY, RATHER THAN THE POLICY OVERRIDING
+THE STAGE
+---------------------------------------------------------------------
+The stage ordering is not a filing system, it is protection against a
+specific failure mode, and it is documented at the top of this module:
+the organizers' rule ends the run after three consecutive iterations that
+improve the primary by less than epsilon = 0.002, and tuning reliably
+produces gains under epsilon. A run that tunes early converges itself to
+a halt before it has tried anything structural.
+
+A search policy optimizing observed reward per token would walk straight
+into that. Hyperparameter moves are cheap and land small positive deltas,
+so early on they look like the best arms available - and picking them is
+precisely what forfeits the run. The policy cannot see this, because the
+cost of an early tuning move is not paid by that move; it is paid later,
+by the structural moves that never get attempted.
+
+So the constraint is structural rather than advisory. The Controller
+intersects STAGE_SLOTS[stage] with the un-blocked slots and offers the
+policy only that set, then validates what comes back. A policy is free to
+be as greedy as it likes inside a stage; it is not free to spend stage one
+on hyperparameters.
+
+The empty entries are entries, not omissions. INIT and FINALIZE mark
+boundaries, REPRODUCE_BASELINE evaluates a fixed published config, and
+DONE is terminal - none of the four propose anything. Listing them
+explicitly means a Stage added later fails the import-time guard below
+rather than raising KeyError deep inside the first attempt that reaches it.
+"""
+
+
+# Import-time guards, in the same spirit as controller.py's BASELINE_SLOTS
+# check. A raise rather than an assert, because `python -O` strips asserts
+# and a stage with no entry would otherwise surface as a KeyError several
+# layers into a run.
+if set(STAGE_SLOTS) != set(Stage):
+    raise RuntimeError(
+        "STAGE_SLOTS must have an entry for every Stage; missing "
+        f"{set(Stage) - set(STAGE_SLOTS)}"
+    )
+_unknown_slots = {
+    slot for slots in STAGE_SLOTS.values() for slot in slots
+} - set(SLOT_ORDER)
+if _unknown_slots:
+    raise RuntimeError(
+        f"STAGE_SLOTS names slots absent from contracts.SLOT_ORDER: {_unknown_slots}"
+    )
+
+
 class HistoryEntry(NamedTuple):
     """One attempted candidate, as the state card summarises it.
 
@@ -142,6 +235,56 @@ class HistoryEntry(NamedTuple):
     delta: Optional[float] = None
     ci95: Optional[tuple[float, float]] = None
     significant: Optional[bool] = None
+
+    target_slot: Optional[SlotName] = None
+    """Which slot this attempt attacked - the arm the policy pulled.
+
+    None only where no slot was chosen: the REPRODUCE_BASELINE evaluation,
+    which runs a fixed published config that no policy selected. Every
+    attempt in a search stage records a slot, including the ones that
+    failed, were rejected, or never got realized.
+
+    Without this the history is a flat list of config_ids and there is no
+    way to ask "how has `weighting` been doing" after the fact - the arm
+    that produced each outcome is simply not written down anywhere.
+    """
+
+    wall_seconds: float = 0.0
+    gpu_seconds: float = 0.0
+    tokens: int = 0
+    """Cost of this ONE attempt, retained per attempt.
+
+    WHY THIS IS KEPT HERE WHEN `with_spend` ALREADY CHARGES THE BUDGET.
+    The two are not redundant, they answer different questions. The Budget
+    counters answer "how much has the run spent in total" - they are a
+    running sum, and a sum cannot be decomposed after the fact. A per-slot
+    policy has to answer "how much has `model` cost me, and what did I get
+    for it", which means attributing every charge to the arm that incurred
+    it. There is exactly one moment at which that attribution is known -
+    when the attempt completes - and if it is not written down then, it is
+    gone. Reconstructing it later from the aggregate counters is not hard,
+    it is impossible.
+
+    FAILED AND UNREALIZED ATTEMPTS CARRY THEIR COST TOO, and this is the
+    part worth being careful about. A candidate that OOM'd after twenty
+    minutes burned twenty minutes. If its entry recorded zero, a
+    cost-aware policy would compute the average cost of the slot that
+    produced it as *lower* than a slot whose candidates all succeed - so
+    the more fragile a slot is, the cheaper it would look, and the harder
+    the policy would push on it. That is exactly backwards, and it is the
+    same reasoning contracts.CandidateResult uses to populate its own cost
+    fields on failure.
+
+    (One honest gap: a hypothesis the realizer could not turn into code
+    never reached the executor, so its recorded cost is genuinely zero
+    here. The realizer's own token spend is real but no port reports it
+    yet - RealizerPort returns a SlotConfig and nothing else. When that
+    changes, this is where the number goes.)
+
+    `tokens` is the single summed figure (in + out) rather than the pair,
+    matching what `with_spend` charges the budget and what the EVAL_RESULT
+    payload logs, so the per-slot totals and the run total are commensurable.
+    """
 
 
 STATE_CARD_HISTORY = 5
@@ -219,6 +362,10 @@ class RunState:
         delta: Optional[float] = None,
         ci95: Optional[tuple[float, float]] = None,
         significant: Optional[bool] = None,
+        target_slot: Optional[SlotName] = None,
+        wall_seconds: float = 0.0,
+        gpu_seconds: float = 0.0,
+        tokens: int = 0,
     ) -> RunState:
         """Record an attempt's result: history always, `iteration` only on
         acceptance.
@@ -226,6 +373,16 @@ class RunState:
         The verdict fields default to None so the baseline adoption and
         failed/unrealized attempts — none of which have a gate ruling —
         record honestly rather than with a fabricated zero.
+
+        `target_slot` and the three cost figures default the same way and
+        for the same reason: the baseline has no slot and an attempt that
+        never reached the executor has no measured spend, so both record
+        their absence rather than a made-up value. Callers that DO have
+        those numbers must pass them for every outcome, acceptance and
+        failure alike - see HistoryEntry's field docs for why a zero on a
+        failed attempt would actively mislead the search policy.
+
+        Still pure: derives a new RunState and touches nothing on this one.
         """
         return replace(
             self,
@@ -239,6 +396,10 @@ class RunState:
                     delta=delta,
                     ci95=ci95,
                     significant=significant,
+                    target_slot=target_slot,
+                    wall_seconds=wall_seconds,
+                    gpu_seconds=gpu_seconds,
+                    tokens=tokens,
                 ),
             ),
         )
@@ -295,6 +456,87 @@ def _charge(counter: BudgetCounter, amount: float) -> BudgetCounter:
     return replace(counter, consumed=counter.consumed + amount)
 
 
+@dataclass(frozen=True)
+class SlotStats:
+    """What one slot has cost and returned, aggregated over the whole run.
+
+    One arm's record, in the vocabulary a bandit needs: how often it was
+    pulled, how often that paid off, what it cost, and the distribution of
+    what it returned.
+
+    Frozen and plain-valued, like everything else in this module, so a
+    snapshot can be logged into a journal payload and still mean what it
+    meant when it was written.
+    """
+
+    attempts: int = 0
+    """Every attempt on this slot, INCLUDING failures and unrealized
+    hypotheses. This is the denominator of a cost-per-attempt figure, and
+    a denominator that quietly dropped the expensive failures would flatter
+    exactly the slots that deserve it least."""
+
+    accepted: int = 0
+    """Attempts the gate accepted. The numerator of the arm's hit rate."""
+
+    total_tokens: int = 0
+    total_wall_seconds: float = 0.0
+
+    deltas: tuple[float, ...] = ()
+    """Gate-measured deltas, oldest first, for attempts that got a ruling.
+
+    Shorter than `attempts` whenever this slot produced a failure or an
+    unrealized hypothesis - those have no delta, and this records that by
+    being absent rather than by contributing a zero. A zero would read as
+    "measured, and it did nothing", which is a different and much stronger
+    claim than "never measured".
+    """
+
+
+def slot_stats(state: RunState) -> dict[SlotName, SlotStats]:
+    """Per-slot aggregation over `state.history`. Pure; a fold, not a cache.
+
+    Recomputed from history on each call rather than maintained
+    incrementally on RunState. History is append-only and short (bounded by
+    the run's node count, which is tens), so the fold is free, and keeping
+    a running tally on a frozen state object would mean two representations
+    of the same fact that can disagree - the class of bug this module's
+    immutability is meant to make impossible.
+
+    Entries with `target_slot is None` are skipped. That is the baseline
+    evaluation, which no policy chose; charging it to an arm would credit
+    or blame a slot for a decision it had nothing to do with.
+
+    Only slots that have actually been attempted appear. An absent key
+    means "no data", which a policy must handle anyway - an untried arm and
+    an arm tried once to no effect are different situations, and a
+    zero-filled entry would erase the difference.
+
+    THE CONSUMER IS THE NEXT PR. The cost-aware bandit reads this to score
+    arms on delta-per-1k-tokens; UniformPolicy ignores it entirely, which
+    is fine and expected. Building the bookkeeping alongside the seam is
+    what keeps that PR to the policy itself instead of bundling a state
+    refactor with it.
+    """
+    stats: dict[SlotName, SlotStats] = {}
+    for entry in state.history:
+        slot = entry.target_slot
+        if slot is None:
+            continue
+        current = stats.get(slot, SlotStats())
+        stats[slot] = SlotStats(
+            attempts=current.attempts + 1,
+            accepted=current.accepted + (1 if entry.accepted else 0),
+            total_tokens=current.total_tokens + entry.tokens,
+            total_wall_seconds=current.total_wall_seconds + entry.wall_seconds,
+            deltas=(
+                current.deltas
+                if entry.delta is None
+                else current.deltas + (entry.delta,)
+            ),
+        )
+    return stats
+
+
 def build_state_card(state: RunState) -> dict[str, Any]:
     """The compact summary handed to `GeneratorPort.propose`.
 
@@ -311,6 +553,40 @@ def build_state_card(state: RunState) -> dict[str, Any]:
     `json.dumps`, which a CandidateResult (nested Metrics, enum members)
     does not.
 
+    THE SELECTED SLOT IS NOT A KEY HERE. DELIBERATE - READ THIS.
+    ------------------------------------------------------------
+    Slot selection moved to the Controller, and the obvious-looking move
+    was to announce the choice in this card. It is not done, for two
+    reasons.
+
+    First, ordering. The policy consumes this card in order to *make* the
+    choice, so at the moment the card is built there is no choice to put
+    in it. Adding the key would mean building the card twice - once for
+    the policy without it, once for the generator with it - and the two
+    would then differ, so "what did the run look like when the slot was
+    picked" and "what did the generator see" would stop being the same
+    question. One card per attempt, handed to both, keeps them honest.
+
+    Second, and more important: a slot named in this dict would be exactly
+    the silent, ignorable directive that GeneratorPort.propose's docstring
+    explains at length is the wrong shape for this constraint. The slot is
+    a parameter on `propose`, where it can be checked against what comes
+    back. Putting a second copy in the card would create a channel through
+    which the constraint could be honoured or not with no way to tell.
+
+    So the card's TOP-LEVEL KEY SET IS UNCHANGED by this PR. W4 codes
+    against the same ten keys as before.
+
+    ONE NESTED CHANGE, FLAGGED BECAUSE W4 READS IT: each entry in
+    `recent_history` now carries four additional keys - `target_slot`
+    (str | None), `wall_seconds` (float), `gpu_seconds` (float) and
+    `tokens` (int) - because HistoryEntry gained those fields and this
+    renders whatever HistoryEntry holds. Additions, not renames: every key
+    that was there before is still there with the same meaning, so nothing
+    reading the old shape breaks. They are genuinely useful to a generator,
+    which can now see which slots recent attempts went to and what they
+    cost rather than inferring it from config_ids it cannot decode.
+
     Keys:
         run_id              str
         stage               str  (Stage value, not the enum)
@@ -318,7 +594,9 @@ def build_state_card(state: RunState) -> dict[str, Any]:
         node                int  evaluations attempted
         incumbent_config_id str | None
         incumbent_primary   float | None
-        recent_history      list of {config_id, primary, accepted, ...}
+        recent_history      list of {config_id, primary, accepted, delta,
+                             ci95, significant, target_slot, wall_seconds,
+                             gpu_seconds, tokens}
         blocked_slots       sorted list of slot names
         budget_remaining    {counter name: float | None}
         convergence         {iterations_considered, epsilon, n_required,

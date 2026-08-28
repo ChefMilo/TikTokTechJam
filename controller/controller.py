@@ -56,6 +56,7 @@ from contracts import (
     PipelineConfig,
     SlotConfig,
     SLOT_ORDER,
+    SlotName,
     Status,
 )
 from controller.ports import (
@@ -64,6 +65,8 @@ from controller.ports import (
     GeneratorExhausted,
     GeneratorPort,
     JournalPort,
+    PolicyContractError,
+    PolicyPort,
     RealizerExhausted,
     RealizerPort,
 )
@@ -71,12 +74,19 @@ from controller.convergence import ITERATION_DEFINITION, assess, is_significant
 from controller.state import (
     RunState,
     STAGE_ORDER,
+    STAGE_SLOTS,
     Stage,
     build_state_card,
     next_stage,
 )
 
-__all__ = ["BASELINE_SLOTS", "UNREALIZED_CONFIG_ID", "Controller", "baseline_pipeline"]
+__all__ = [
+    "BASELINE_SLOTS",
+    "MISPROPOSED_CONFIG_ID",
+    "UNREALIZED_CONFIG_ID",
+    "Controller",
+    "baseline_pipeline",
+]
 
 UNREALIZED_CONFIG_ID = "<unrealized>"
 """Stands in for a candidate the realizer could not produce.
@@ -85,6 +95,19 @@ UNREALIZED_CONFIG_ID = "<unrealized>"
 config has no content to hash. A visible sentinel beats an empty string:
 in the state card's `recent_history` it reads as an explicit "this attempt
 produced nothing", rather than as a value someone forgot to fill in.
+"""
+
+
+MISPROPOSED_CONFIG_ID = "<slot-mismatch>"
+"""Stands in for a hypothesis the generator aimed at the wrong slot.
+
+Kept distinct from UNREALIZED_CONFIG_ID rather than folded into it, even
+though both mark "this attempt produced no config". They are different
+failures with different owners: an unrealized candidate means the realizer
+could not write the code, while this one means the generator ignored an
+explicit instruction. Those want different fixes and should be countable
+separately in the log - a run with ten of these has a prompting problem,
+a run with ten unrealized candidates has a library problem.
 """
 
 
@@ -132,6 +155,7 @@ class Controller:
         gate: GatePort,
         generator: GeneratorPort,
         realizer: RealizerPort,
+        policy: PolicyPort,
         journal: JournalPort,
         budget: Optional[Budget] = None,
         seeds: Sequence[int] = (0,),
@@ -146,6 +170,16 @@ class Controller:
         # caller who forgot to pass one would get a working run built on a
         # component they never chose.
         self._realizer = realizer
+        # Required, never defaulted - same reasoning as the realizer above,
+        # and this seam is the entire point of the change that introduced
+        # it. Slot selection used to happen implicitly: the Controller read
+        # `payload.target_slot` off whatever the generator returned and
+        # spliced there. Defaulting to, say, UniformPolicy would swap one
+        # invisible choice for another and a caller who never thought about
+        # the search policy would still get one, silently. Making it
+        # required forces the wiring into every call site, where it is
+        # visible in a diff and in a stack trace.
+        self._policy = policy
         self._journal = journal
         # An unlimited Budget by default. No agreed wall-clock, token or
         # evaluation ceiling exists anywhere in the repo yet, and inventing
@@ -238,8 +272,36 @@ class Controller:
                 )
                 return state, "budget_exhausted"
 
+            # Recomputed every attempt rather than once per stage:
+            # blocked_slots only ever grows, so a slot blocked partway
+            # through a stage must stop being offered for the rest of it.
+            candidate_slots = self._candidate_slots(state, stage)
+            if stage is not Stage.REPRODUCE_BASELINE and not candidate_slots:
+                # Nothing left to attack in this stage. That ends the
+                # STAGE, not the run: a later stage has a different slot
+                # set (STAGE_3_TUNE permits all six), so slots exhausted
+                # here says nothing about what is available there.
+                #
+                # No node is consumed and the generator is never called.
+                # `node` counts evaluations attempted, and there is no
+                # candidate here to attempt - inventing one so the loop
+                # has something to count would put a phantom attempt in
+                # the journal.
+                self._emit(
+                    state,
+                    EventKind.SLOT_BLOCKED,
+                    {
+                        "stage": stage.value,
+                        "stage_slots": list(STAGE_SLOTS[stage]),
+                        "blocked_slots": sorted(state.blocked_slots),
+                        "reason": "every slot this stage may attack is blocked",
+                        "action": "end_stage",
+                    },
+                )
+                return state, None
+
             try:
-                state, attempt_stop = self._attempt(state, stage)
+                state, attempt_stop = self._attempt(state, stage, candidate_slots)
             except GeneratorExhausted as exc:
                 # Running out of scripted hypotheses is a normal end to a
                 # test run, not a crash. Ending through the ordinary
@@ -265,17 +327,46 @@ class Controller:
 
         return state, None
 
-    def _attempt(
+    def _candidate_slots(
         self, state: RunState, stage: Stage
+    ) -> tuple[SlotName, ...]:
+        """This stage's permitted slots, minus the ones the run has blocked.
+
+        The set the policy is allowed to choose from, and the set the
+        Controller validates its answer against. Order follows
+        STAGE_SLOTS - which follows SLOT_ORDER - rather than set iteration
+        order, so a policy that depends on the order it is handed (like
+        FixedOrderPolicy) behaves identically across runs and across
+        Python processes.
+
+        Two filters, deliberately composed here rather than left to the
+        policy: the stage constraint protects the run's plan from a greedy
+        policy (see STAGE_SLOTS) and blocked_slots keeps the search off
+        arms already known to be broken. Neither is something a policy
+        should be trusted to remember to apply.
+        """
+        return tuple(
+            slot for slot in STAGE_SLOTS[stage] if slot not in state.blocked_slots
+        )
+
+    def _attempt(
+        self, state: RunState, stage: Stage, candidate_slots: tuple[SlotName, ...]
     ) -> tuple[RunState, Optional[str]]:
         """Evaluate one candidate, end to end.
 
         Returns (state, stop_reason). The stop_reason is non-None only when
         this candidate's commit tripped convergence — a dead candidate
         never ends the run.
+
+        `candidate_slots` is computed by the caller and is guaranteed
+        non-empty for every stage except REPRODUCE_BASELINE, which selects
+        no slot at all.
         """
         state = state.with_node_started()
         is_baseline = stage is Stage.REPRODUCE_BASELINE
+        # None for the baseline: it evaluates a fixed published config that
+        # no policy chose, so there is no arm to charge it to.
+        target_slot: Optional[SlotName] = None
 
         if is_baseline:
             # No HYPOTHESIS event: the baseline is a known published
@@ -284,8 +375,83 @@ class Controller:
             # would defeat the point of reproducing it.
             config = baseline_pipeline()
         else:
-            payload = self._generator.propose(build_state_card(state))
+            # ONE card, built once, handed to both. If the policy and the
+            # generator saw different cards, "what did the run look like
+            # when this slot was picked" and "what did the generator know"
+            # would be two different questions with two different answers,
+            # and the journal could not answer either from one event.
+            state_card = build_state_card(state)
+            target_slot = self._policy.select_slot(state_card, candidate_slots)
+            if target_slot not in candidate_slots:
+                # Loud, immediately, at the point of the bug. The policy is
+                # our own deterministic code - not an LLM - so this is not
+                # a runtime condition to absorb, it is a defect. Carrying
+                # on would attribute every subsequent cost and delta to the
+                # wrong arm, and the run would look fine while measuring
+                # something else. See ports.PolicyContractError.
+                raise PolicyContractError(
+                    f"{type(self._policy).__name__}.select_slot returned "
+                    f"{target_slot!r}, which is not among the candidate slots "
+                    f"{candidate_slots} offered in stage {stage.value}"
+                )
+
+            payload = self._generator.propose(state_card, target_slot)
+            # Emitted before the check below, and unconditionally: the
+            # journal records what the generator actually said, including
+            # when what it said was wrong. A HYPOTHESIS event suppressed on
+            # mismatch would leave an ERROR referring to a proposal that
+            # appears nowhere in the log.
             self._emit(state, EventKind.HYPOTHESIS, asdict(payload))
+
+            if payload.target_slot != target_slot:
+                # THE DETERMINISTIC GUARD ON A GENERATOR THAT WANDERED.
+                # The Controller does not obey the payload's choice. It was
+                # asked for a hypothesis about one slot and returned one
+                # about another, so what came back does not answer the
+                # question the search policy asked - splicing it in would
+                # hand slot selection back to the LLM through the back door,
+                # which is the exact behaviour this PR removed.
+                #
+                # Classified CONTRACT for the same reason the realizer path
+                # is: the collaborator failed to honour its side of the
+                # port, rather than the candidate failing to train.
+                #
+                # A dead candidate, not a dead run. An LLM ignoring an
+                # instruction is an expected operating condition; the node
+                # is counted, the attempt is recorded, and the loop moves
+                # on to the next candidate.
+                self._emit(
+                    state,
+                    EventKind.ERROR,
+                    {
+                        "config_id": MISPROPOSED_CONFIG_ID,
+                        "reason": "generator_slot_mismatch",
+                        "requested_slot": target_slot,
+                        "proposed_slot": payload.target_slot,
+                        "error_class": ErrorClass.CONTRACT.value,
+                        "error_excerpt": (
+                            f"generator was asked for {target_slot!r} and "
+                            f"proposed {payload.target_slot!r}"
+                        ),
+                    },
+                )
+                return (
+                    state.with_outcome(
+                        MISPROPOSED_CONFIG_ID,
+                        None,
+                        accepted=False,
+                        # Charged to the slot that was REQUESTED, not the
+                        # one the generator named. The requested slot is
+                        # the arm the policy pulled, and an arm whose
+                        # proposals keep coming back malformed is genuinely
+                        # performing badly - crediting the attempt to a
+                        # slot nobody selected would hide that.
+                        target_slot=target_slot,
+                        **_attempt_cost(None),
+                    ),
+                    None,
+                )
+
             try:
                 config = self._realize(state, payload)
             except RealizerExhausted as exc:
@@ -308,7 +474,15 @@ class Controller:
                 )
                 return (
                     state.with_outcome(
-                        UNREALIZED_CONFIG_ID, None, accepted=False
+                        UNREALIZED_CONFIG_ID,
+                        None,
+                        accepted=False,
+                        target_slot=target_slot,
+                        # Genuinely zero: this candidate never reached the
+                        # executor, so it consumed no evaluation cost. The
+                        # realizer's own tokens are real spend but no port
+                        # reports them yet - see HistoryEntry's cost docs.
+                        **_attempt_cost(None),
                     ),
                     None,
                 )
@@ -347,7 +521,20 @@ class Controller:
                     "error_excerpt": result.error_excerpt,
                 },
             )
-            return state.with_outcome(result.config_id, None, accepted=False), None
+            return (
+                state.with_outcome(
+                    result.config_id,
+                    None,
+                    accepted=False,
+                    target_slot=target_slot,
+                    # NON-ZERO, and that is the whole point. A candidate
+                    # that died halfway still burned what it took to get
+                    # there; recording zero would make the slot that
+                    # produced it look cheap. See HistoryEntry's cost docs.
+                    **_attempt_cost(result),
+                ),
+                None,
+            )
 
         if state.incumbent is None:
             # Nothing to compare against yet, so the gate is not called —
@@ -371,7 +558,13 @@ class Controller:
             # on its own: with no predecessor there is no improvement to
             # difference, and with no gate ruling its `significant` is None,
             # which breaks the internal rule's streak rather than feeding it.
-            state = state.with_outcome(result.config_id, primary, accepted=True)
+            state = state.with_outcome(
+                result.config_id,
+                primary,
+                accepted=True,
+                target_slot=target_slot,
+                **_attempt_cost(result),
+            )
             return self._check_convergence(state)
 
         verdict = self._gate.compare(result, state.incumbent)
@@ -397,6 +590,8 @@ class Controller:
             # Computed once, here, so the stored flag and the DECISION event
             # can never disagree about what the same interval meant.
             significant=is_significant(verdict.ci95),
+            target_slot=target_slot,
+            **_attempt_cost(result),
         )
         if not verdict.accept:
             # Only committed revisions are iterations, so a rejection
@@ -542,6 +737,36 @@ class Controller:
                 payload=payload,
             )
         )
+
+
+def _attempt_cost(result: Optional[CandidateResult]) -> dict[str, Any]:
+    """This attempt's cost, in the keyword shape `with_outcome` takes.
+
+    A helper rather than four inline literals because it is written at four
+    call sites - accepted, rejected, failed and unrealized - and the one
+    thing that must be true of all four is that they agree. If the failure
+    path ever spelled its cost differently from the success path, a
+    cost-aware policy would read a systematic bias between slots that fail
+    often and slots that do not, which is precisely the signal it is meant
+    to be measuring.
+
+    `None` means the attempt never reached the executor (unrealized, or a
+    slot mismatch), so there is no measured spend to record. That is an
+    honest zero, not a placeholder: no evaluation was run. It is NOT the
+    same as a FAILED result, which has real numbers on it and must carry
+    them.
+
+    `tokens` is summed in+out to match what `with_spend` charges the budget
+    and what EVAL_RESULT logs, so the per-slot totals and the run-level
+    counters are the same quantity.
+    """
+    if result is None:
+        return {"wall_seconds": 0.0, "gpu_seconds": 0.0, "tokens": 0}
+    return {
+        "wall_seconds": result.wall_seconds,
+        "gpu_seconds": result.gpu_seconds,
+        "tokens": result.tokens_in + result.tokens_out,
+    }
 
 
 def _mean_primary(result: Optional[CandidateResult]) -> Optional[float]:
