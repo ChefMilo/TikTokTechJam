@@ -275,6 +275,17 @@ class EventKind(str, Enum):
     BUDGET_WARNING = "budget_warning"
     FINALIZE = "finalize"
 
+    RUN_END = "run_end"
+    """Terminal event of a completed run, emitted however the run ended
+    (normally, out of budget, or out of hypotheses).
+
+    Crash-resume depends on replay being able to tell "the log ends
+    because the run finished" from "the log ends because the process
+    died". Without a terminal event those two are indistinguishable, and
+    a resume would either re-run finished work or abandon a live one.
+    Budget's own docstring already refers to ending "through a normal
+    RUN_END event"; this is the member that reference needed."""
+
 
 # Keys every journal line must carry. Kept beside JournalEvent's field list
 # so the two cannot drift apart silently.
