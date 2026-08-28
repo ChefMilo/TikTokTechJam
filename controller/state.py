@@ -47,6 +47,7 @@ from contracts import (
     PipelineConfig,
     SlotName,
 )
+from controller import convergence
 
 __all__ = [
     "STAGE_CARD_HISTORY",
@@ -115,15 +116,32 @@ def next_stage(current: Stage) -> Optional[Stage]:
 class HistoryEntry(NamedTuple):
     """One attempted candidate, as the state card summarises it.
 
-    A NamedTuple so it is genuinely a `(config_id, primary, accepted)`
-    triple — indexable and JSON-serialisable as an array — while still
-    being readable at the call site. `primary` is None for a candidate
-    that failed before producing scores.
+    A NamedTuple so the first three fields are still genuinely a
+    `(config_id, primary, accepted)` triple — indexable and
+    JSON-serialisable as an array — while remaining readable at the call
+    site. `primary` is None for a candidate that failed before producing
+    scores.
+
+    WHY THE VERDICT FIELDS ARE RETAINED HERE: the gate's `delta` is a
+    *paired* per-seed difference, and it is the only measurement that
+    properly accounts for sigma (~0.0008) sitting a factor of 2.5 below
+    epsilon (0.002). It used to be computed, logged into the DECISION
+    event, and then thrown away — which left convergence with nothing but
+    differenced absolute primaries, whose noise is sqrt(2)*sigma ~= 0.0011,
+    over half of epsilon. A rule built on those alone fires on noise.
+    Keeping delta/ci95/significant is what makes the noise-aware internal
+    rule possible at all.
+
+    All three are None where no gate ruling exists: the baseline adoption
+    (nothing to compare against) and any failed or unrealized candidate.
     """
 
     config_id: str
     primary: Optional[float]
     accepted: bool
+    delta: Optional[float] = None
+    ci95: Optional[tuple[float, float]] = None
+    significant: Optional[bool] = None
 
 
 STATE_CARD_HISTORY = 5
@@ -194,14 +212,35 @@ class RunState:
         return replace(self, incumbent=result, incumbent_config=config)
 
     def with_outcome(
-        self, config_id: str, primary: Optional[float], accepted: bool
+        self,
+        config_id: str,
+        primary: Optional[float],
+        accepted: bool,
+        delta: Optional[float] = None,
+        ci95: Optional[tuple[float, float]] = None,
+        significant: Optional[bool] = None,
     ) -> RunState:
         """Record an attempt's result: history always, `iteration` only on
-        acceptance."""
+        acceptance.
+
+        The verdict fields default to None so the baseline adoption and
+        failed/unrealized attempts — none of which have a gate ruling —
+        record honestly rather than with a fabricated zero.
+        """
         return replace(
             self,
             iteration=self.iteration + (1 if accepted else 0),
-            history=self.history + (HistoryEntry(config_id, primary, accepted),),
+            history=self.history
+            + (
+                HistoryEntry(
+                    config_id=config_id,
+                    primary=primary,
+                    accepted=accepted,
+                    delta=delta,
+                    ci95=ci95,
+                    significant=significant,
+                ),
+            ),
         )
 
     def with_spend(self, result: CandidateResult) -> RunState:
@@ -223,6 +262,22 @@ class RunState:
                 gpu_seconds=_charge(self.budget.gpu_seconds, result.gpu_seconds),
             ),
         )
+
+    @property
+    def committed_revisions(self) -> tuple[HistoryEntry, ...]:
+        """Accepted attempts only, OLDEST FIRST.
+
+        The window convergence reads. Oldest-first so that `[-N:]` is the
+        most recent N revisions, matching how both rules are phrased ("the
+        last N iterations") and how `_improvements` differences
+        consecutive pairs.
+
+        Rejected, failed and unrealized attempts are excluded by
+        construction: an iteration is a committed revision, so a dead end
+        is not one. Every entry here therefore has a non-None `primary`,
+        which is what lets the convergence rules skip None-handling.
+        """
+        return tuple(entry for entry in self.history if entry.accepted)
 
     def with_blocked_slot(self, slot: SlotName) -> RunState:
         """Mark a slot as off-limits for further proposals.
@@ -263,10 +318,15 @@ def build_state_card(state: RunState) -> dict[str, Any]:
         node                int  evaluations attempted
         incumbent_config_id str | None
         incumbent_primary   float | None
-        recent_history      list of {config_id, primary, accepted}
+        recent_history      list of {config_id, primary, accepted, ...}
         blocked_slots       sorted list of slot names
         budget_remaining    {counter name: float | None}
+        convergence         {iterations_considered, epsilon, n_required,
+                             flat_streak, converged, by_rule}
     """
+    committed = state.committed_revisions
+    status = convergence.assess(committed)
+
     incumbent_primary: Optional[float] = None
     if state.incumbent is not None and state.incumbent.val:
         incumbent_primary = sum(
@@ -285,14 +345,42 @@ def build_state_card(state: RunState) -> dict[str, Any]:
         ),
         "incumbent_primary": incumbent_primary,
         "recent_history": [
-            entry._asdict() for entry in state.history[-STATE_CARD_HISTORY:]
+            _history_as_json(entry) for entry in state.history[-STATE_CARD_HISTORY:]
         ],
         "blocked_slots": sorted(state.blocked_slots),
         "budget_remaining": {
             name: _remaining_or_none(getattr(state.budget, name))
             for name in BUDGET_COUNTER_ORDER
         },
+        # How close the run is to stopping. Actionable context for the
+        # generator: "one more flat iteration ends this" is a reason to
+        # propose something bolder rather than another safe tweak.
+        "convergence": {
+            "iterations_considered": status.iterations_considered,
+            "epsilon": status.epsilon,
+            "n_required": status.n_required,
+            "flat_streak": convergence.flat_streak(committed),
+            "converged": status.converged,
+            "by_rule": status.by_rule,
+        },
     }
+
+
+def _history_as_json(entry: HistoryEntry) -> dict[str, Any]:
+    """One history entry, in the shape it will have after a JSON hop.
+
+    `ci95` is a tuple on the way in and a list on the way out — json has
+    only one sequence type. Converting here means what the Controller hands
+    the generator is byte-identical to what a generator on the far side of
+    a serialisation boundary receives, so a card cannot pass a
+    round-trip assertion in-process and then arrive subtly different in
+    production. It also keeps `json.loads(json.dumps(card)) == card` true,
+    which is the cheapest possible check that this interface is portable.
+    """
+    fields = entry._asdict()
+    if fields["ci95"] is not None:
+        fields["ci95"] = list(fields["ci95"])
+    return fields
 
 
 def _remaining_or_none(counter: BudgetCounter) -> Optional[float]:

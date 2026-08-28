@@ -16,6 +16,7 @@ import pytest
 from contracts import (
     Budget,
     BudgetCounter,
+    CandidateResult,
     Citation,
     ErrorClass,
     EventKind,
@@ -27,13 +28,16 @@ from controller.controller import BASELINE_SLOTS, Controller, baseline_pipeline
 from controller.fakes import (
     AlwaysAcceptGate,
     AlwaysRejectGate,
+    DeltaGate,
     DeterministicRealizer,
     FakeExecutor,
     InMemoryJournal,
     ScriptedGenerator,
     ScriptedRealizer,
+    metrics_from_delta,
 )
 from controller.ports import RealizerExhausted
+from controller import convergence
 from controller.state import (
     STAGE_ORDER,
     STATE_CARD_HISTORY,
@@ -46,9 +50,9 @@ from controller.state import (
 
 # A default run is 1 baseline evaluation plus nodes_per_stage candidates in
 # each of the three search stages.
-NODES_PER_STAGE = 3
+MAX_NODES_PER_STAGE = 3
 SEARCH_STAGES = 3
-SEARCH_CANDIDATES = NODES_PER_STAGE * SEARCH_STAGES  # 9
+SEARCH_CANDIDATES = MAX_NODES_PER_STAGE * SEARCH_STAGES  # 9
 TOTAL_CANDIDATES = SEARCH_CANDIDATES + 1  # 10, including the baseline
 
 
@@ -70,6 +74,53 @@ def _script(n: int = SEARCH_CANDIDATES) -> list[HypothesisPayload]:
     return [_hypothesis(i) for i in range(n)]
 
 
+class _ClimbingExecutor:
+    """Primaries that climb by a fixed step, so neither rule converges.
+
+    FakeExecutor draws i.i.d. around a constant, which is exactly right for
+    testing acceptance logic and exactly wrong for testing loop mechanics:
+    differenced primaries hover near zero, so the organizers' rule reads
+    every iteration as flat and the run converges after four commits.
+    Tests that need a run to go the distance need scores that genuinely
+    improve by more than epsilon each time.
+    """
+
+    def __init__(self, step: float = 0.01, fail_on=None) -> None:
+        self.step = step
+        self._fail_on = fail_on
+        self._committed = 0
+        self.calls: list[tuple[str, tuple[int, ...]]] = []
+
+    def run(self, config: PipelineConfig, seeds) -> CandidateResult:
+        seeds = tuple(seeds)
+        self.calls.append((config.config_id, seeds))
+        failure = self._fail_on(config) if self._fail_on is not None else None
+        if failure is not None:
+            error_class, excerpt = failure
+            return CandidateResult(
+                config_id=config.config_id,
+                status=Status.FAILED,
+                val={},
+                backtest={},
+                error_class=error_class,
+                error_excerpt=excerpt,
+                wall_seconds=40.0 * len(seeds),
+                tokens_in=900,
+                tokens_out=300,
+            )
+        metrics = metrics_from_delta(self.step * self._committed)
+        self._committed += 1
+        return CandidateResult(
+            config_id=config.config_id,
+            status=Status.OK,
+            val={seed: metrics for seed in seeds},
+            backtest={seed: metrics for seed in seeds},
+            wall_seconds=40.0 * len(seeds),
+            tokens_in=900,
+            tokens_out=300,
+        )
+
+
 def _controller(
     *,
     gate=None,
@@ -79,11 +130,15 @@ def _controller(
     journal=None,
     budget=None,
     run_id="run-test",
-    nodes_per_stage=NODES_PER_STAGE,
+    max_nodes_per_stage=MAX_NODES_PER_STAGE,
 ) -> tuple[Controller, InMemoryJournal]:
     journal = journal if journal is not None else InMemoryJournal()
     controller = Controller(
-        executor=executor if executor is not None else FakeExecutor(seed=1),
+        # Climbing by default so the mechanics tests still see a full run:
+        # with convergence live, a flat executor stops the loop after four
+        # commits and every count below would be measuring convergence
+        # instead of the thing it names.
+        executor=executor if executor is not None else _ClimbingExecutor(),
         gate=gate if gate is not None else AlwaysAcceptGate(),
         generator=generator if generator is not None else ScriptedGenerator(_script()),
         # DeterministicRealizer by default: a test about the loop should not
@@ -92,7 +147,7 @@ def _controller(
         realizer=realizer if realizer is not None else DeterministicRealizer(),
         journal=journal,
         budget=budget,
-        nodes_per_stage=nodes_per_stage,
+            max_nodes_per_stage=max_nodes_per_stage,
         run_id=run_id,
     )
     return controller, journal
@@ -218,6 +273,7 @@ def test_state_card_has_the_documented_keys_and_is_strict_json():
         "recent_history",
         "blocked_slots",
         "budget_remaining",
+        "convergence",
     }
     # allow_nan=False proves it is RFC-valid JSON, not just Python-parseable:
     # an unmetered budget counter must not leak an `Infinity` token.
@@ -386,7 +442,7 @@ def test_a_failed_candidate_does_not_stop_the_run():
         return None
 
     controller, journal = _controller(
-        executor=FakeExecutor(seed=1, fail_on=fail_impl_3)
+        executor=_ClimbingExecutor(fail_on=fail_impl_3)
     )
 
     state = controller.run()
@@ -533,7 +589,7 @@ def test_different_executor_seeds_change_the_numbers_but_not_the_shape():
 
 
 def test_controller_records_the_seeds_it_asked_for():
-    executor = FakeExecutor(seed=1)
+    executor = _ClimbingExecutor()
     controller, _ = _controller(executor=executor)
     controller.run()
 
@@ -559,7 +615,7 @@ class _RecordingExecutor:
     assertions below need the config itself.
     """
 
-    def __init__(self, inner: FakeExecutor) -> None:
+    def __init__(self, inner) -> None:
         self._inner = inner
         self.configs: list[PipelineConfig] = []
 
@@ -675,7 +731,7 @@ def test_code_emitted_never_carries_the_code_blob_itself():
 def test_realized_candidate_records_lineage_and_differs_in_one_slot():
     """parent_id is what makes the search tree reconstructable from the
     journal alone."""
-    executor = _RecordingExecutor(FakeExecutor(seed=1))
+    executor = _RecordingExecutor(_ClimbingExecutor())
     controller, _ = _controller(executor=executor, gate=AlwaysAcceptGate())
     controller.run()
 
@@ -760,3 +816,255 @@ def test_realizer_receives_every_non_baseline_hypothesis():
     assert [h.citation.key for h in realizer.calls] == [
         f"paper{i}" for i in range(SEARCH_CANDIDATES)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Convergence — appended. Nothing above this line is modified.
+# ---------------------------------------------------------------------------
+
+
+def _convergence_events(journal: InMemoryJournal):
+    return journal.events_of_kind(EventKind.CONVERGENCE_CHECK)
+
+
+def test_a_flat_run_converges_and_says_so():
+    """DeltaGate(0.0005) gives a ci95 straddling zero, so no candidate is
+    significantly better; FakeExecutor's flat scores also make the
+    organizers' rule fire. Either way the run must stop early and say why."""
+    controller, journal = _controller(
+        executor=FakeExecutor(seed=1), gate=DeltaGate(delta=0.0005)
+    )
+
+    state = controller.run()
+
+    assert state.stage is Stage.DONE
+    run_end = journal.events_of_kind(EventKind.RUN_END)[0]
+    assert run_end.payload["stop_reason"] == "converged"
+    assert journal.events_of_kind(EventKind.FINALIZE)[0].payload["stop_reason"] == (
+        "converged"
+    )
+    assert state.node < TOTAL_CANDIDATES  # stopped before the cap
+
+
+def test_convergence_check_is_emitted_after_every_commit():
+    controller, journal = _controller(
+        executor=FakeExecutor(seed=1), gate=DeltaGate(delta=0.0005)
+    )
+    state = controller.run()
+
+    checks = _convergence_events(journal)
+
+    assert len(checks) == state.iteration  # one per committed revision
+    assert checks[-1].payload["converged"] is True
+    assert checks[-1].payload["by_rule"] in {"organizers", "internal"}
+    for earlier in checks[:-1]:
+        assert earlier.payload["converged"] is False
+
+
+def test_convergence_check_records_the_iteration_definition():
+    """So a journal reader can see which reading of "iteration" produced
+    the number, and can re-render under the other using `node`."""
+    controller, journal = _controller(
+        executor=FakeExecutor(seed=1), gate=DeltaGate(delta=0.0005)
+    )
+    controller.run()
+
+    payload = _convergence_events(journal)[0].payload
+
+    assert payload["iteration_definition"] == convergence.ITERATION_DEFINITION
+    assert payload["iteration_definition"] == "committed_revision"
+    assert set(payload) == {
+        "iteration_definition",
+        "converged",
+        "by_rule",
+        "organizers_converged",
+        "internal_converged",
+        "recent_deltas",
+        "recent_significant",
+        "iterations_considered",
+        "epsilon",
+        "n_required",
+    }
+    assert payload["epsilon"] == convergence.EPSILON
+    assert payload["n_required"] == convergence.N_CONSECUTIVE
+
+
+def test_convergence_check_comes_after_decision():
+    controller, journal = _controller(
+        executor=FakeExecutor(seed=1), gate=DeltaGate(delta=0.0005)
+    )
+    controller.run()
+
+    kinds = _kinds(journal)
+    for i, kind in enumerate(kinds):
+        if kind == EventKind.CONVERGENCE_CHECK.value:
+            assert kinds[i - 1] == EventKind.DECISION.value
+
+
+def test_a_climbing_run_never_converges_and_completes_its_stages():
+    """Real improvements above epsilon, and a ci95 strictly above zero, so
+    neither rule can fire. The run must go the distance."""
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(step=0.01), gate=DeltaGate(delta=0.01)
+    )
+
+    state = controller.run()
+
+    assert state.stage is Stage.DONE
+    assert journal.events_of_kind(EventKind.RUN_END)[0].payload["stop_reason"] == (
+        "stages_complete"
+    )
+    assert all(not e.payload["converged"] for e in _convergence_events(journal))
+    assert state.node == TOTAL_CANDIDATES
+
+
+def test_the_cap_still_bounds_a_run_that_never_converges():
+    """max_nodes_per_stage is the backstop. Without it, an accepting gate
+    and an unlimited default Budget could run forever."""
+    controller, _ = _controller(
+        executor=_ClimbingExecutor(step=0.01),
+        gate=DeltaGate(delta=0.01),
+        max_nodes_per_stage=2,
+    )
+
+    state = controller.run()
+
+    # 1 baseline + 3 search stages * 2 attempts.
+    assert state.node == 1 + SEARCH_STAGES * 2
+    assert state.node <= 1 + SEARCH_STAGES * 2  # an upper bound, explicitly
+
+
+def test_the_baseline_alone_cannot_converge():
+    """One committed revision, no predecessor to difference against and no
+    gate ruling to judge — neither rule may fire on it."""
+    journal = InMemoryJournal()
+    controller = Controller(
+        executor=_ClimbingExecutor(),
+        gate=AlwaysAcceptGate(),
+        generator=ScriptedGenerator([]),  # exhausts right after the baseline
+        realizer=DeterministicRealizer(),
+        journal=journal,
+        run_id="run-baseline-only",
+    )
+
+    state = controller.run()
+
+    checks = _convergence_events(journal)
+    assert len(checks) == 1
+    assert checks[0].payload["converged"] is False
+    assert checks[0].payload["iterations_considered"] == 1
+    assert state.iteration == 1
+    assert journal.events_of_kind(EventKind.RUN_END)[0].payload["stop_reason"] == (
+        "generator_exhausted"
+    )
+
+
+def test_only_committed_revisions_enter_the_convergence_window():
+    """DECISION 1, pinned: rejected, failed and unrealized candidates are
+    not iterations. If they counted, three dead ends in a row would end the
+    search before it had searched."""
+
+    def fail_impl_1(config: PipelineConfig):
+        if config.slots["model"].impl == "lib/impl_1":
+            return ErrorClass.OOM, "out of memory"
+        return None
+
+    controller, _ = _controller(
+        executor=_ClimbingExecutor(fail_on=fail_impl_1),
+        gate=DeltaGate(delta=0.01, accept=False),  # every gated candidate rejected
+        realizer=_FlakyRealizer(fail_on_key="paper2"),
+    )
+
+    state = controller.run()
+
+    committed = state.committed_revisions
+    # Only the baseline was ever committed; everything else was rejected,
+    # failed or unrealized.
+    assert len(committed) == 1
+    assert state.iteration == 1
+    assert len(state.history) == TOTAL_CANDIDATES  # they all still happened
+
+    rejected = [h for h in state.history if not h.accepted]
+    assert len(rejected) == TOTAL_CANDIDATES - 1
+    assert all(entry not in committed for entry in rejected)
+
+
+def test_history_entry_verdict_fields_are_none_where_no_gate_ruled():
+    def fail_impl_1(config: PipelineConfig):
+        if config.slots["model"].impl == "lib/impl_1":
+            return ErrorClass.OOM, "out of memory"
+        return None
+
+    controller, _ = _controller(
+        executor=_ClimbingExecutor(fail_on=fail_impl_1),
+        gate=DeltaGate(delta=0.01),
+        realizer=_FlakyRealizer(fail_on_key="paper2"),
+    )
+
+    state = controller.run()
+    history = list(state.history)
+
+    baseline = history[0]
+    assert (baseline.delta, baseline.ci95, baseline.significant) == (None, None, None)
+
+    failed = [h for h in history if h.primary is None and h.config_id != "<unrealized>"]
+    assert failed and all(
+        (h.delta, h.ci95, h.significant) == (None, None, None) for h in failed
+    )
+
+    unrealized = [h for h in history if h.config_id == "<unrealized>"]
+    assert unrealized and all(
+        (h.delta, h.ci95, h.significant) == (None, None, None) for h in unrealized
+    )
+
+    gated = [h for h in history if h.delta is not None]
+    assert gated
+    for entry in gated:
+        assert entry.delta == pytest.approx(0.01)
+        assert entry.significant is True  # ci95 strictly above zero
+        assert entry.ci95[0] < entry.delta < entry.ci95[1]
+
+
+def test_state_card_convergence_summary_round_trips_as_json():
+    controller, _ = _controller(
+        executor=_ClimbingExecutor(step=0.01), gate=DeltaGate(delta=0.01)
+    )
+    state = controller.run()
+
+    card = build_state_card(state)
+
+    assert set(card["convergence"]) == {
+        "iterations_considered",
+        "epsilon",
+        "n_required",
+        "flat_streak",
+        "converged",
+        "by_rule",
+    }
+    assert card["convergence"]["converged"] is False
+    assert card["convergence"]["flat_streak"] == 0  # every step beat epsilon
+    assert json.loads(json.dumps(card, allow_nan=False)) == card
+
+
+def test_state_card_reports_a_flat_streak_when_the_run_stalls():
+    controller, _ = _controller(
+        executor=FakeExecutor(seed=1), gate=DeltaGate(delta=0.0005)
+    )
+    state = controller.run()
+
+    card = build_state_card(state)
+
+    assert card["convergence"]["flat_streak"] >= 1
+    assert card["convergence"]["iterations_considered"] == state.iteration
+
+
+def test_run_start_records_the_renamed_cap():
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(), gate=DeltaGate(delta=0.01)
+    )
+    controller.run()
+
+    payload = journal.events_of_kind(EventKind.RUN_START)[0].payload
+
+    assert payload["max_nodes_per_stage"] == MAX_NODES_PER_STAGE
+    assert "nodes_per_stage" not in payload

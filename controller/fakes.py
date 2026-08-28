@@ -37,7 +37,7 @@ from contracts import (
 # That is the whole point of the hierarchy: the Controller catches the port
 # contract, so swapping a double for W4's real component changes nothing
 # about how failure is handled.
-from controller.ports import GeneratorExhausted, RealizerExhausted
+from controller.ports import GeneratorExhausted, PortExhausted, RealizerExhausted
 
 __all__ = [
     "BASELINE_GAUC",
@@ -46,11 +46,14 @@ __all__ = [
     "BASELINE_SIGMA",
     "AlwaysAcceptGate",
     "AlwaysRejectGate",
+    "DeltaGate",
     "DeterministicRealizer",
     "FakeExecutor",
     "FailureHook",
     "InMemoryJournal",
     "ScriptExhaustedError",
+    "ScriptedGate",
+    "ScriptedGateExhausted",
     "ScriptedGenerator",
     "ScriptedRealizer",
     "mean_primary",
@@ -492,3 +495,100 @@ class AlwaysRejectGate(_ConstantGate):
 
     _ACCEPT = False
     _REASON = "AlwaysRejectGate: rejects unconditionally (test double)"
+class ScriptedGateExhausted(PortExhausted):
+    """A ScriptedGate was asked for one verdict more than it was given.
+
+    Fake-specific name on a port-level base, exactly like
+    ScriptExhaustedError — so it is catchable as PortExhausted without the
+    Controller ever importing this module.
+
+    WHY THE CONTROLLER DELIBERATELY DOES NOT CATCH IT: a generator running
+    out is a normal end to a run, and a realizer failing on one hypothesis
+    is a localized failure the architecture is built to absorb. Neither is
+    true here. A gate is asked to rule on a candidate the run has *already
+    paid to evaluate*, and a gate with nothing to say about it is not a
+    condition that can occur in production — it means the test under-
+    provisioned its script. Surfacing that loudly beats absorbing it and
+    letting a test pass for the wrong reason.
+    """
+
+
+class ScriptedGate:
+    """Returns a fixed, ordered list of Verdicts. For exact control.
+
+    Does not cycle and does not repeat the last verdict, for the same
+    reason ScriptedGenerator and ScriptedRealizer do not: silently
+    supplying an extra ruling would let a test assert on a convergence
+    window it never actually specified.
+    """
+
+    def __init__(self, verdicts: Sequence[Verdict]) -> None:
+        self._verdicts = tuple(verdicts)
+        self._index = 0
+        self.calls: list[tuple[CandidateResult, CandidateResult]] = []
+        """(candidate, incumbent) for every comparison, in order."""
+
+    def compare(self, candidate: CandidateResult, incumbent: CandidateResult) -> Verdict:
+        self.calls.append((candidate, incumbent))
+        if self._index >= len(self._verdicts):
+            raise ScriptedGateExhausted(
+                f"ScriptedGate exhausted after {len(self._verdicts)} verdicts; "
+                f"the Controller asked for one more"
+            )
+        verdict = self._verdicts[self._index]
+        self._index += 1
+        return verdict
+
+    @property
+    def remaining(self) -> int:
+        """Verdicts left in the script."""
+        return len(self._verdicts) - self._index
+
+
+class DeltaGate:
+    """Returns the same fixed delta every time, with a ci95 centred on it.
+
+    The instrument for driving convergence with exact numbers, since
+    FakeExecutor's scores are random draws and cannot be aimed. Two
+    settings matter:
+
+    - `delta` feeds the DECISION payload and HistoryEntry.delta.
+    - `half_width` decides significance. The default is 1.96 * sigma, so
+      `DeltaGate(delta=0.0005)` yields ci95 = (-0.00107, +0.00207), which
+      straddles zero: not significant, and three consecutive such commits
+      converge the internal rule. `DeltaGate(delta=0.01)` yields
+      (+0.00843, +0.01157), strictly positive: significant, and the
+      internal rule never fires.
+
+    Note this gate does NOT move the executor's scores — the organizers'
+    rule differences absolute primaries and is therefore driven by the
+    executor, not by this. A test that wants to hold the organizers' rule
+    off needs an executor whose primaries climb by more than epsilon.
+    """
+
+    def __init__(
+        self,
+        delta: float,
+        accept: bool = True,
+        half_width: float = 1.96 * BASELINE_SIGMA,
+    ) -> None:
+        self.delta = delta
+        self.accept = accept
+        self.half_width = half_width
+        self.calls: list[tuple[CandidateResult, CandidateResult]] = []
+
+    def compare(self, candidate: CandidateResult, incumbent: CandidateResult) -> Verdict:
+        self.calls.append((candidate, incumbent))
+        return Verdict(
+            accept=self.accept,
+            delta=self.delta,
+            ci95=(self.delta - self.half_width, self.delta + self.half_width),
+            # Mirrors the validation delta: these doubles do not model a
+            # candidate that wins on one split and loses on the other.
+            backtest_delta=self.delta,
+            reason=(
+                f"DeltaGate: fixed delta {self.delta:+.5f}, "
+                f"accept={self.accept} (test double)"
+            ),
+        )
+

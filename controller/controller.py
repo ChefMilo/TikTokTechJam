@@ -20,6 +20,18 @@ disagree under some input, and the journal stops being an explanation of
 why a candidate was kept. If you are reading this because you want to add
 "just a quick check that delta > 0" — that belongs in the gate.
 
+WHAT COUNTS AS AN ITERATION
+---------------------------
+A committed revision — a candidate the gate accepted — not every attempt.
+The organizers' rule ends a run after N consecutive iterations that improve
+the primary by no more than epsilon; counting rejected dead ends toward N
+would end a search the moment it tried three bad ideas in a row, which is
+the opposite of exploring. Every CONVERGENCE_CHECK payload stamps
+`iteration_definition` so the journal says which reading produced its
+numbers, and `node` is tracked alongside `iteration` so the log can be
+re-rendered under the other reading without re-running anything. See
+controller/convergence.py.
+
 Determinism: given the same doubles, the same seeds and the same run_id,
 two runs emit an identical sequence of events apart from `ts`. Nothing
 here sleeps, writes files, touches the network, or reads the clock except
@@ -55,6 +67,7 @@ from controller.ports import (
     RealizerExhausted,
     RealizerPort,
 )
+from controller.convergence import ITERATION_DEFINITION, assess, is_significant
 from controller.state import (
     RunState,
     STAGE_ORDER,
@@ -122,7 +135,7 @@ class Controller:
         journal: JournalPort,
         budget: Optional[Budget] = None,
         seeds: Sequence[int] = (0,),
-        nodes_per_stage: int = 3,
+        max_nodes_per_stage: int = 3,
         run_id: Optional[str] = None,
     ) -> None:
         self._executor = executor
@@ -140,7 +153,12 @@ class Controller:
         # made on purpose.
         self._budget = budget if budget is not None else Budget()
         self._seeds = tuple(seeds)
-        self._nodes_per_stage = nodes_per_stage
+        # Renamed from `nodes_per_stage` to say what it is: a backstop, not
+        # the thing that decides when a stage is done. Convergence ends the
+        # run; this caps a stage so that a run which never converges — with
+        # an unlimited default Budget and an accepting gate — still
+        # terminates. It is the only hard termination guarantee left.
+        self._max_nodes_per_stage = max_nodes_per_stage
         # Callers who want a byte-reproducible journal should pass run_id;
         # the generated default is deliberately unique per run so two runs
         # cannot be confused for one another in a shared log.
@@ -158,7 +176,7 @@ class Controller:
             EventKind.RUN_START,
             {
                 "seeds": list(self._seeds),
-                "nodes_per_stage": self._nodes_per_stage,
+                "max_nodes_per_stage": self._max_nodes_per_stage,
                 "stage_order": [s.value for s in STAGE_ORDER],
             },
         )
@@ -205,7 +223,7 @@ class Controller:
     ) -> tuple[RunState, Optional[str]]:
         """Attempt this stage's candidates. Returns (state, stop_reason)."""
         # REPRODUCE_BASELINE is a single fixed evaluation, not a search.
-        attempts = 1 if stage is Stage.REPRODUCE_BASELINE else self._nodes_per_stage
+        attempts = 1 if stage is Stage.REPRODUCE_BASELINE else self._max_nodes_per_stage
 
         for _ in range(attempts):
             if state.budget.exhausted:
@@ -221,7 +239,7 @@ class Controller:
                 return state, "budget_exhausted"
 
             try:
-                state = self._attempt(state, stage)
+                state, attempt_stop = self._attempt(state, stage)
             except GeneratorExhausted as exc:
                 # Running out of scripted hypotheses is a normal end to a
                 # test run, not a crash. Ending through the ordinary
@@ -238,10 +256,24 @@ class Controller:
                 )
                 return state, "generator_exhausted"
 
+            if attempt_stop is not None:
+                # Convergence ends the RUN, not just this stage: the
+                # organizers' rule is written about the agent's iteration
+                # loop as a whole, and reinterpreting it per-stage would be
+                # a stretch we would then have to defend.
+                return state, attempt_stop
+
         return state, None
 
-    def _attempt(self, state: RunState, stage: Stage) -> RunState:
-        """Evaluate one candidate, end to end."""
+    def _attempt(
+        self, state: RunState, stage: Stage
+    ) -> tuple[RunState, Optional[str]]:
+        """Evaluate one candidate, end to end.
+
+        Returns (state, stop_reason). The stop_reason is non-None only when
+        this candidate's commit tripped convergence — a dead candidate
+        never ends the run.
+        """
         state = state.with_node_started()
         is_baseline = stage is Stage.REPRODUCE_BASELINE
 
@@ -274,8 +306,11 @@ class Controller:
                         "error_excerpt": str(exc),
                     },
                 )
-                return state.with_outcome(
-                    UNREALIZED_CONFIG_ID, None, accepted=False
+                return (
+                    state.with_outcome(
+                        UNREALIZED_CONFIG_ID, None, accepted=False
+                    ),
+                    None,
                 )
 
         self._emit(
@@ -312,7 +347,7 @@ class Controller:
                     "error_excerpt": result.error_excerpt,
                 },
             )
-            return state.with_outcome(result.config_id, None, accepted=False)
+            return state.with_outcome(result.config_id, None, accepted=False), None
 
         if state.incumbent is None:
             # Nothing to compare against yet, so the gate is not called —
@@ -331,7 +366,13 @@ class Controller:
                     "reason": "first candidate adopted as incumbent; nothing to compare against",
                 },
             )
-            return state.with_outcome(result.config_id, primary, accepted=True)
+            # A committed revision, so it counts toward `iteration` and is
+            # assessed like any other — but it can never converge anything
+            # on its own: with no predecessor there is no improvement to
+            # difference, and with no gate ruling its `significant` is None,
+            # which breaks the internal rule's streak rather than feeding it.
+            state = state.with_outcome(result.config_id, primary, accepted=True)
+            return self._check_convergence(state)
 
         verdict = self._gate.compare(result, state.incumbent)
         self._emit(
@@ -347,7 +388,51 @@ class Controller:
         )
         if verdict.accept:
             state = state.with_incumbent(result, config)
-        return state.with_outcome(result.config_id, primary, accepted=verdict.accept)
+        state = state.with_outcome(
+            result.config_id,
+            primary,
+            accepted=verdict.accept,
+            delta=verdict.delta,
+            ci95=verdict.ci95,
+            # Computed once, here, so the stored flag and the DECISION event
+            # can never disagree about what the same interval meant.
+            significant=is_significant(verdict.ci95),
+        )
+        if not verdict.accept:
+            # Only committed revisions are iterations, so a rejection
+            # changes nothing convergence looks at.
+            return state, None
+        return self._check_convergence(state)
+
+    def _check_convergence(self, state: RunState) -> tuple[RunState, Optional[str]]:
+        """Assess both stopping rules after a commit and log the result.
+
+        Emitted after DECISION, never instead of it: the decision and the
+        consequence of that decision are two separate facts and a reader
+        should see both. The payload carries the whole ConvergenceStatus so
+        the event is self-contained — someone auditing the run can re-check
+        the arithmetic without reconstructing the window from surrounding
+        events — plus `iteration_definition`, so it is unambiguous which
+        reading of "iteration" produced the numbers.
+        """
+        status = assess(state.committed_revisions)
+        self._emit(
+            state,
+            EventKind.CONVERGENCE_CHECK,
+            {
+                "iteration_definition": ITERATION_DEFINITION,
+                "converged": status.converged,
+                "by_rule": status.by_rule,
+                "organizers_converged": status.organizers_converged,
+                "internal_converged": status.internal_converged,
+                "recent_deltas": list(status.recent_deltas),
+                "recent_significant": list(status.recent_significant),
+                "iterations_considered": status.iterations_considered,
+                "epsilon": status.epsilon,
+                "n_required": status.n_required,
+            },
+        )
+        return state, ("converged" if status.converged else None)
 
     def _finalize(self, state: RunState, stop_reason: Optional[str]) -> RunState:
         """Enter FINALIZE, log the terminal events, land in DONE."""

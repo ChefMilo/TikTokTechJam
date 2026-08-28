@@ -619,3 +619,102 @@ def test_the_two_exhaustion_kinds_do_not_catch_each_other():
     """A realizer giving up must not be mistaken for the run being over."""
     assert not issubclass(RealizerExhausted, GeneratorExhausted)
     assert not issubclass(GeneratorExhausted, RealizerExhausted)
+
+
+# ---------------------------------------------------------------------------
+# Configurable gate doubles — appended. Nothing above this line is modified.
+# ---------------------------------------------------------------------------
+
+from contracts import Verdict
+from controller.fakes import DeltaGate, ScriptedGate, ScriptedGateExhausted
+from controller.convergence import is_significant
+
+
+def _result(delta_from_baseline: float = 0.0, seeds=(0, 1)) -> CandidateResult:
+    metrics = metrics_from_delta(delta_from_baseline)
+    return CandidateResult(
+        config_id=f"cfg{delta_from_baseline}",
+        status=Status.OK,
+        val={s: metrics for s in seeds},
+        backtest={s: metrics for s in seeds},
+    )
+
+
+def test_configurable_gates_satisfy_the_port():
+    assert isinstance(DeltaGate(0.0), GatePort)
+    assert isinstance(ScriptedGate([]), GatePort)
+    assert not isinstance(DeltaGate(0.0), ExecutorPort)
+
+
+def test_delta_gate_returns_its_fixed_delta_regardless_of_the_candidates():
+    gate = DeltaGate(delta=0.0042)
+
+    first = gate.compare(_result(0.0), _result(0.0))
+    second = gate.compare(_result(0.5), _result(-0.5))
+
+    assert first == second
+    assert first.delta == 0.0042
+    assert first.backtest_delta == 0.0042
+    assert len(gate.calls) == 2
+
+
+def test_delta_gate_small_delta_is_not_significant():
+    """The setting that drives the internal rule to converge: a ci95 of
+    +-1.96 sigma around a delta this small straddles zero."""
+    verdict = DeltaGate(delta=0.0005).compare(_result(), _result())
+
+    assert is_significant(verdict.ci95) is False
+    assert verdict.ci95[0] < 0.0 < verdict.ci95[1]
+
+
+def test_delta_gate_large_delta_is_significant():
+    """The setting that holds the internal rule off."""
+    verdict = DeltaGate(delta=0.01).compare(_result(), _result())
+
+    assert is_significant(verdict.ci95) is True
+    assert verdict.ci95[0] > 0.0
+
+
+def test_delta_gate_accept_flag_is_independent_of_significance():
+    """Acceptance is the gate's business; significance is a separate
+    reading of the same interval. A double must be able to vary them
+    independently or the Controller's two paths cannot be told apart."""
+    rejecting = DeltaGate(delta=0.01, accept=False).compare(_result(), _result())
+
+    assert rejecting.accept is False
+    assert is_significant(rejecting.ci95) is True
+
+
+def test_scripted_gate_returns_verdicts_in_order_and_records_calls():
+    verdicts = [
+        Verdict(accept=True, delta=0.01, ci95=(0.005, 0.015), backtest_delta=0.01, reason="a"),
+        Verdict(accept=False, delta=0.0, ci95=(-0.01, 0.01), backtest_delta=0.0, reason="b"),
+    ]
+    gate = ScriptedGate(verdicts)
+
+    returned = [gate.compare(_result(), _result()) for _ in range(2)]
+
+    assert returned == verdicts
+    assert len(gate.calls) == 2
+    assert gate.remaining == 0
+
+
+def test_scripted_gate_raises_rather_than_repeating_its_last_verdict():
+    """Repeating would let a test assert on a convergence window it never
+    actually specified."""
+    gate = ScriptedGate(
+        [Verdict(accept=True, delta=0.0, ci95=(0.0, 0.0), backtest_delta=0.0, reason="only")]
+    )
+    gate.compare(_result(), _result())
+
+    with pytest.raises(ScriptedGateExhausted):
+        gate.compare(_result(), _result())
+
+
+def test_scripted_gate_exhaustion_is_a_port_exception():
+    """Catchable as PortExhausted without importing this module — but the
+    Controller deliberately does not catch it, because a gate with nothing
+    to say about an already-evaluated candidate is a test-setup bug."""
+    assert issubclass(ScriptedGateExhausted, PortExhausted)
+    assert not issubclass(ScriptedGateExhausted, GeneratorExhausted)
+    assert not issubclass(ScriptedGateExhausted, RealizerExhausted)
