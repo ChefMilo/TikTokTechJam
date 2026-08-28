@@ -276,6 +276,50 @@ class EventKind(str, Enum):
     FINALIZE = "finalize"
 
 
+# Keys every journal line must carry. Kept beside JournalEvent's field list
+# so the two cannot drift apart silently.
+_REQUIRED_EVENT_KEYS: tuple[str, ...] = (
+    "ts",
+    "run_id",
+    "iteration",
+    "node",
+    "kind",
+    "payload",
+)
+
+# Journal lines can be long (a payload may embed a traceback or a code blob).
+# Error messages quote only the first stretch, enough to identify the line in
+# the file without dumping the whole thing into a log or a test failure.
+_ERROR_LINE_EXCERPT = 120
+
+
+class JournalDecodeError(ValueError):
+    """Raised by `JournalEvent.from_jsonl` on a line it cannot decode.
+
+    Why this exists rather than letting the underlying error escape: the
+    journal is an append-only log whose whole purpose is crash-resume, and
+    a run killed mid-write leaves a truncated final line. Replay must be
+    able to recognise that case and stop cleanly at the last intact event.
+    Previously the failure modes were inconsistent and un-catchable as a
+    group — bad JSON raised `json.JSONDecodeError`, a missing field raised
+    a bare `KeyError`, and an unrecognised kind raised a bare `ValueError`
+    — so a resume loop had to catch three unrelated exception types and
+    could not tell "this line is torn" from "this code has a bug".
+
+    Subclasses `ValueError` so existing `except ValueError` handlers keep
+    working. Carries `problem` and the offending `line` as attributes for
+    callers that want to log or re-raise with more context.
+    """
+
+    def __init__(self, problem: str, line: str) -> None:
+        self.problem = problem
+        self.line = line
+        excerpt = line[:_ERROR_LINE_EXCERPT]
+        if len(line) > _ERROR_LINE_EXCERPT:
+            excerpt += "..."
+        super().__init__(f"{problem}; offending line: {excerpt!r}")
+
+
 @dataclass(frozen=True)
 class JournalEvent:
     """One append-only log record.
@@ -311,13 +355,43 @@ class JournalEvent:
 
     @classmethod
     def from_jsonl(cls, line: str) -> "JournalEvent":
-        data = json.loads(line)
+        """Parse one journal line. Inverse of `to_jsonl`.
+
+        Raises `JournalDecodeError` — never a bare `KeyError` — for every
+        malformed input, so a crash-resume replay can catch one exception
+        type and stop at the last intact event. The accepted on-disk format
+        is unchanged: any line that parsed before still parses to an
+        identical object.
+        """
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise JournalDecodeError(f"not valid JSON ({exc.msg})", line) from exc
+
+        if not isinstance(data, dict):
+            raise JournalDecodeError(
+                f"expected a JSON object, got {type(data).__name__}", line
+            )
+
+        missing = [key for key in _REQUIRED_EVENT_KEYS if key not in data]
+        if missing:
+            raise JournalDecodeError(
+                f"missing required key(s): {', '.join(missing)}", line
+            )
+
+        try:
+            kind = EventKind(data["kind"])
+        except ValueError as exc:
+            raise JournalDecodeError(
+                f"unknown EventKind {data['kind']!r}", line
+            ) from exc
+
         return cls(
             ts=data["ts"],
             run_id=data["run_id"],
             iteration=data["iteration"],
             node=data["node"],
-            kind=EventKind(data["kind"]),
+            kind=kind,
             payload=data["payload"],
         )
 
@@ -331,6 +405,11 @@ class JournalEvent:
 # without adding safety here.
 #
 #   HYPOTHESIS:
+#     AUTHORITATIVE SHAPE: the `HypothesisPayload` dataclass in PART 4
+#     below. The dict sketch here is retained for readability alongside
+#     the other payload kinds, but it is no longer the source of truth —
+#     if the two ever disagree, the dataclass wins. Build the payload with
+#     `dataclasses.asdict(hypothesis)` rather than hand-rolling the dict.
 #     {
 #       "target_slot": SlotName,
 #       "rationale": str,
@@ -369,3 +448,164 @@ class JournalEvent:
 #       "iteration_affected": int,
 #     }
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# PART 4: HypothesisPayload
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Citation:
+    """Where a proposed method comes from.
+
+    All three fields are required rather than optional because the final
+    report has to attribute every accepted change to a real, checkable
+    technique. An agent that cannot name a source for what it is doing is
+    guessing, and a guess that happens to win is not a result we can
+    defend to anyone reading the log afterwards.
+    """
+
+    key: str  # short bibliographic handle, e.g. "rendle2010fm"
+    url: str  # resolvable link to the paper or documentation
+    library_entry: str  # id of the matching entry in the methods/ YAML library
+
+
+@dataclass(frozen=True)
+class HypothesisPayload:
+    """A proposed change to one slot, emitted by the hypothesis generator.
+
+    Promoted from the documented dict sketch in the payload-shapes comment
+    above into a real type. That shape was enforced by nothing, so a
+    renamed or dropped key would have surfaced as a KeyError deep inside
+    the controller, long after the generator that caused it had returned.
+    Field names match the comment exactly, so `dataclasses.asdict()` of
+    this object is a drop-in replacement for the hand-built dict and no
+    journal reader has to change.
+
+    `predecessor_evidence` is a tuple rather than a list because this is a
+    frozen value object and a list field would still be mutable in place;
+    it serializes to the same JSON array the comment specifies. It carries
+    the config_ids of earlier candidates that motivated this proposal, and
+    defaults to empty because the first hypothesis of a run has no
+    predecessors.
+    """
+
+    target_slot: SlotName
+    rationale: str
+    citation: Citation
+
+    expected_gain: float
+    """Forecast improvement in the primary metric.
+
+    ADVISORY ONLY — it must never gate acceptance. It is logged before the
+    candidate is evaluated purely so that afterwards we can score the
+    generator's forecast calibration (predicted gain vs. realized delta).
+    The moment it influenced a decision it would stop being an honest
+    measurement and become a self-fulfilling one: only the noise gate, on
+    measured per-seed evidence, decides what is kept. Using it to *order*
+    the search queue is fine — that changes what we try first, never what
+    we accept.
+    """
+
+    expected_cost_s: float
+    predecessor_evidence: tuple[str, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# PART 5: Budget
+# ---------------------------------------------------------------------------
+
+
+BUDGET_COUNTER_ORDER: tuple[str, ...] = (
+    "wall_seconds",
+    "tokens",
+    "evaluations",
+    "gpu_seconds",
+)
+"""Fixed reporting order for `Budget`'s counters.
+
+Pinned here rather than derived from `dataclasses.fields()` so the order
+in a BUDGET_WARNING journal payload stays stable even if the field
+declaration order is ever reshuffled — a run archived today must render
+the same way next week.
+"""
+
+
+@dataclass(frozen=True)
+class BudgetCounter:
+    """One metered resource: how much may be spent, and how much has been.
+
+    `limit` defaults to infinity so a resource the run does not actually
+    meter (GPU seconds on a CPU-only box) can be left alone rather than
+    forcing every caller to invent a sentinel.
+    """
+
+    limit: float = float("inf")
+    consumed: float = 0.0
+
+    @property
+    def remaining(self) -> float:
+        """Headroom left. Goes negative once the limit is overshot, which
+        is deliberate: an overshoot is worth seeing in the log rather than
+        being clamped to zero and hidden."""
+        return self.limit - self.consumed
+
+    @property
+    def exhausted(self) -> bool:
+        """True at or past the limit.
+
+        `>=`, not `>`: a limit of zero means do not start. Deciding this
+        once, here, is the point — an off-by-one on this predicate is the
+        difference between stopping cleanly and overrunning the budget the
+        run was graded on.
+        """
+        return self.consumed >= self.limit
+
+
+@dataclass(frozen=True)
+class Budget:
+    """The run's spending envelope across every metered resource.
+
+    Held by the controller, which checks it before starting a candidate.
+    Exceeding a budget must end the run through a normal RUN_END event,
+    never by being killed — an unfinished journal cannot be reported on.
+
+    Frozen like every other value object here, so spending is recorded by
+    deriving a new Budget rather than mutating one:
+
+        budget = dataclasses.replace(
+            budget,
+            evaluations=dataclasses.replace(
+                budget.evaluations, consumed=budget.evaluations.consumed + 1
+            ),
+        )
+
+    That is deliberately more verbose than `+= 1`. It means a Budget
+    captured in a journal payload or passed to another component cannot be
+    changed underneath the holder, so a BUDGET_WARNING event records what
+    was actually true when it was written.
+    """
+
+    wall_seconds: BudgetCounter = field(default_factory=BudgetCounter)
+    tokens: BudgetCounter = field(default_factory=BudgetCounter)
+    evaluations: BudgetCounter = field(default_factory=BudgetCounter)
+    gpu_seconds: BudgetCounter = field(default_factory=BudgetCounter)
+
+    @property
+    def tripped(self) -> tuple[str, ...]:
+        """Names of every counter at or past its limit, in
+        BUDGET_COUNTER_ORDER.
+
+        Returns all of them rather than the first, because two limits can
+        land on the same evaluation and a report that named only one would
+        misattribute why the run stopped.
+        """
+        return tuple(
+            name for name in BUDGET_COUNTER_ORDER if getattr(self, name).exhausted
+        )
+
+    @property
+    def exhausted(self) -> bool:
+        """True when ANY counter is at or past its limit."""
+        return bool(self.tripped)

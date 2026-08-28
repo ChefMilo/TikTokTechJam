@@ -1,0 +1,10 @@
+# Test configuration only.
+#
+# Deliberately no [project] and no [build-system]: the repo is a set of
+# sibling top-level packages imported from the repo root, not an
+# installable distribution. Adding packaging metadata would change how
+# every module imports, which is out of scope here.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
