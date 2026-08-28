@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific
+data/*
+artifacts/*
+*.npy
+*.csv
+__pycache__/
+.venv/
+.env
+.DS_Store
+
+!data/.gitkeep
+!artifacts/.gitkeep
