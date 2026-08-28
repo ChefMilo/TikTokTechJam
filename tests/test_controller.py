@@ -27,10 +27,13 @@ from controller.controller import BASELINE_SLOTS, Controller, baseline_pipeline
 from controller.fakes import (
     AlwaysAcceptGate,
     AlwaysRejectGate,
+    DeterministicRealizer,
     FakeExecutor,
     InMemoryJournal,
     ScriptedGenerator,
+    ScriptedRealizer,
 )
+from controller.ports import RealizerExhausted
 from controller.state import (
     STAGE_ORDER,
     STATE_CARD_HISTORY,
@@ -72,6 +75,7 @@ def _controller(
     gate=None,
     executor=None,
     generator=None,
+    realizer=None,
     journal=None,
     budget=None,
     run_id="run-test",
@@ -82,6 +86,10 @@ def _controller(
         executor=executor if executor is not None else FakeExecutor(seed=1),
         gate=gate if gate is not None else AlwaysAcceptGate(),
         generator=generator if generator is not None else ScriptedGenerator(_script()),
+        # DeterministicRealizer by default: a test about the loop should not
+        # have to maintain a config script in lockstep with its hypothesis
+        # script just to get a candidate out the other end.
+        realizer=realizer if realizer is not None else DeterministicRealizer(),
         journal=journal,
         budget=budget,
         nodes_per_stage=nodes_per_stage,
@@ -297,6 +305,9 @@ def test_event_sequence_is_exactly_as_expected():
     assert kinds.count(EventKind.EVAL_RESULT.value) == TOTAL_CANDIDATES
     assert kinds.count(EventKind.DECISION.value) == TOTAL_CANDIDATES
     assert kinds.count(EventKind.HYPOTHESIS.value) == SEARCH_CANDIDATES
+    # One CODE_EMITTED per realized candidate — the baseline is not
+    # realized, so it matches HYPOTHESIS rather than EVAL_START.
+    assert kinds.count(EventKind.CODE_EMITTED.value) == SEARCH_CANDIDATES
 
 
 def test_baseline_is_adopted_unconditionally_without_calling_the_gate():
@@ -309,6 +320,7 @@ def test_baseline_is_adopted_unconditionally_without_calling_the_gate():
         executor=FakeExecutor(seed=1),
         gate=ExplodingGate(),
         generator=ScriptedGenerator([]),  # exhausts right after the baseline
+        realizer=DeterministicRealizer(),
         journal=journal,
         run_id="run-baseline",
     )
@@ -487,6 +499,7 @@ def test_two_identical_runs_emit_identical_event_sequences():
             executor=FakeExecutor(seed=7),
             gate=AlwaysAcceptGate(),
             generator=ScriptedGenerator(_script()),
+            realizer=DeterministicRealizer(),
             journal=journal,
             run_id="run-determinism",
         ).run()
@@ -505,6 +518,7 @@ def test_different_executor_seeds_change_the_numbers_but_not_the_shape():
             executor=FakeExecutor(seed=seed),
             gate=AlwaysAcceptGate(),
             generator=ScriptedGenerator(_script()),
+            realizer=DeterministicRealizer(),
             journal=journal,
             run_id="run-shape",
         ).run()
@@ -525,3 +539,224 @@ def test_controller_records_the_seeds_it_asked_for():
 
     assert all(seeds == (0,) for _config_id, seeds in executor.calls)
     assert len(executor.calls) == TOTAL_CANDIDATES
+
+
+# ---------------------------------------------------------------------------
+# The realizer seam — appended. Nothing above this line is modified.
+# ---------------------------------------------------------------------------
+
+import ast
+import pathlib
+
+from contracts import SlotConfig
+import controller.controller as controller_module
+
+
+class _RecordingExecutor:
+    """Delegates to a FakeExecutor while keeping the PipelineConfig objects.
+
+    FakeExecutor.calls records only (config_id, seeds); the lineage
+    assertions below need the config itself.
+    """
+
+    def __init__(self, inner: FakeExecutor) -> None:
+        self._inner = inner
+        self.configs: list[PipelineConfig] = []
+
+    def run(self, config: PipelineConfig, seeds):
+        self.configs.append(config)
+        return self._inner.run(config, seeds)
+
+
+class _FlakyRealizer:
+    """Realizes everything except one nominated hypothesis."""
+
+    def __init__(self, fail_on_key: str) -> None:
+        self._fail_on_key = fail_on_key
+        self._inner = DeterministicRealizer()
+
+    def realize(self, hypothesis: HypothesisPayload) -> SlotConfig:
+        if hypothesis.citation.key == self._fail_on_key:
+            raise RealizerExhausted(
+                f"no library entry realizable for {hypothesis.citation.key}"
+            )
+        return self._inner.realize(hypothesis)
+
+
+def test_controller_module_imports_nothing_from_the_test_doubles():
+    """Structural, not a comment: parses controller.py's own import
+    statements so the layering wart cannot silently come back."""
+    source = pathlib.Path(controller_module.__file__).read_text(encoding="utf-8")
+    modules: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+        elif isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+
+    assert "controller.fakes" not in modules
+    assert not any(m.endswith("fakes") for m in modules), modules
+    assert "controller.ports" in modules  # it does still depend on the seams
+
+
+def test_realizer_is_required_and_has_no_default():
+    """A default would silently supply the very wiring this seam exists to
+    make explicit."""
+    with pytest.raises(TypeError):
+        Controller(
+            executor=FakeExecutor(seed=0),
+            gate=AlwaysAcceptGate(),
+            generator=ScriptedGenerator(_script()),
+            journal=InMemoryJournal(),
+        )
+
+
+def test_code_emitted_sits_between_hypothesis_and_eval_start():
+    controller, journal = _controller()
+    controller.run()
+
+    kinds = _kinds(journal)
+    positions = [i for i, k in enumerate(kinds) if k == EventKind.CODE_EMITTED.value]
+
+    assert len(positions) == SEARCH_CANDIDATES
+    for i in positions:
+        assert kinds[i - 1] == EventKind.HYPOTHESIS.value
+        assert kinds[i + 1] == EventKind.EVAL_START.value
+
+
+def test_baseline_emits_no_code_emitted():
+    """REPRODUCE_BASELINE evaluates a published config directly — nothing
+    is proposed and nothing is realized."""
+    controller, journal = _controller()
+    controller.run()
+
+    kinds = _kinds(journal)
+    first_eval = kinds.index(EventKind.EVAL_START.value)
+    assert EventKind.CODE_EMITTED.value not in kinds[:first_eval]
+
+
+def test_code_emitted_payload_records_the_realized_slot():
+    controller, journal = _controller()
+    controller.run()
+
+    payload = journal.events_of_kind(EventKind.CODE_EMITTED)[0].payload
+
+    assert set(payload) == {
+        "target_slot",
+        "impl",
+        "has_code_blob",
+        "code_blob_chars",
+    }
+    assert payload["target_slot"] == "model"
+    assert payload["impl"] == "lib/impl_0"
+    assert payload["has_code_blob"] is False
+    assert payload["code_blob_chars"] == 0
+
+
+def test_code_emitted_never_carries_the_code_blob_itself():
+    """A journal that inlines generated source stops being readable. Record
+    that code exists and how much of it, never the text."""
+    blob = "def score(x):" + ("\n    pass" * 400)
+    realizer = ScriptedRealizer(
+        [SlotConfig(impl="custom", code_blob=blob) for _ in range(SEARCH_CANDIDATES)]
+    )
+    controller, journal = _controller(realizer=realizer)
+    controller.run()
+
+    assert len(blob) > 1000  # long enough that inlining would be obvious
+    for event in journal.events_of_kind(EventKind.CODE_EMITTED):
+        assert event.payload["has_code_blob"] is True
+        assert event.payload["code_blob_chars"] == len(blob)
+        rendered = json.dumps(event.payload)
+        assert blob not in rendered
+        assert "pass" not in rendered
+
+
+def test_realized_candidate_records_lineage_and_differs_in_one_slot():
+    """parent_id is what makes the search tree reconstructable from the
+    journal alone."""
+    executor = _RecordingExecutor(FakeExecutor(seed=1))
+    controller, _ = _controller(executor=executor, gate=AlwaysAcceptGate())
+    controller.run()
+
+    baseline = executor.configs[0]
+    first = executor.configs[1]
+    second = executor.configs[2]
+
+    assert baseline.parent_id is None  # nothing preceded it
+    assert first.parent_id == baseline.config_id
+    # AlwaysAcceptGate promotes every candidate, so the next one descends
+    # from the one immediately before it.
+    assert second.parent_id == first.config_id
+
+    differing = [s for s in baseline.slots if baseline.slots[s] != first.slots[s]]
+    assert differing == ["model"]  # exactly the target slot, nothing else
+
+
+def test_lineage_does_not_perturb_identity():
+    """parent_id is not part of the content hash, so recording ancestry
+    never changes a candidate's cache key."""
+    slots = dict(BASELINE_SLOTS)
+    without = PipelineConfig(slots=slots)
+    with_parent = PipelineConfig(slots=slots, parent_id="some-ancestor")
+
+    assert without.config_id == with_parent.config_id
+
+
+def test_realizer_failure_kills_the_candidate_not_the_run():
+    realizer = _FlakyRealizer(fail_on_key="paper4")
+    controller, journal = _controller(realizer=realizer)
+
+    state = controller.run()
+
+    assert state.stage is Stage.DONE
+    assert state.node == TOTAL_CANDIDATES  # the dead candidate still counted
+
+    errors = [
+        e
+        for e in journal.events_of_kind(EventKind.ERROR)
+        if e.payload.get("reason") == "realizer_exhausted"
+    ]
+    assert len(errors) == 1
+    assert errors[0].payload["error_class"] == ErrorClass.CONTRACT.value
+    assert errors[0].payload["target_slot"] == "model"
+    assert "paper4" in errors[0].payload["error_excerpt"]
+
+    # That candidate never reached the executor, so it produced no
+    # CODE_EMITTED, no EVAL_START and no DECISION — every other one did.
+    kinds = _kinds(journal)
+    assert kinds.count(EventKind.HYPOTHESIS.value) == SEARCH_CANDIDATES
+    assert kinds.count(EventKind.CODE_EMITTED.value) == SEARCH_CANDIDATES - 1
+    assert kinds.count(EventKind.EVAL_START.value) == TOTAL_CANDIDATES - 1
+    assert kinds.count(EventKind.DECISION.value) == TOTAL_CANDIDATES - 1
+    assert kinds[-1] == EventKind.RUN_END.value
+    assert journal.events_of_kind(EventKind.RUN_END)[0].payload["stop_reason"] == (
+        "stages_complete"
+    )
+
+
+def test_unrealized_candidate_shows_up_in_history_as_a_sentinel():
+    realizer = _FlakyRealizer(fail_on_key="paper0")
+    controller, _ = _controller(realizer=realizer)
+
+    state = controller.run()
+
+    sentinels = [
+        h for h in state.history if h.config_id == controller_module.UNREALIZED_CONFIG_ID
+    ]
+    assert len(sentinels) == 1
+    assert sentinels[0].primary is None
+    assert sentinels[0].accepted is False
+
+
+def test_realizer_receives_every_non_baseline_hypothesis():
+    realizer = ScriptedRealizer(
+        [SlotConfig(impl=f"scripted_{i}") for i in range(SEARCH_CANDIDATES)]
+    )
+    controller, _ = _controller(realizer=realizer)
+    controller.run()
+
+    assert len(realizer.calls) == SEARCH_CANDIDATES
+    assert [h.citation.key for h in realizer.calls] == [
+        f"paper{i}" for i in range(SEARCH_CANDIDATES)
+    ]

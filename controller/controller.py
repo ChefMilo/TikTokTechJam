@@ -2,7 +2,8 @@
 
 It walks STAGE_ORDER, and within each stage attempts a fixed number of
 candidates. For each candidate it asks the generator for a hypothesis,
-turns that into a PipelineConfig, has the executor evaluate it, asks the
+asks the realizer to turn that hypothesis into slot code, splices the
+result into the incumbent pipeline, has the executor evaluate it, asks the
 gate whether it beat the incumbent, and writes an event to the journal at
 every step.
 
@@ -36,6 +37,7 @@ from typing import Any, Optional
 from contracts import (
     Budget,
     CandidateResult,
+    ErrorClass,
     EventKind,
     HypothesisPayload,
     JournalEvent,
@@ -44,17 +46,15 @@ from contracts import (
     SLOT_ORDER,
     Status,
 )
-from controller.ports import ExecutorPort, GatePort, GeneratorPort, JournalPort
-
-# LAYERING WART, KNOWN AND FLAGGED: this pulls an exception type out of the
-# test doubles into production code. It is intra-package (both live in
-# controller/) and fakes.py is a permanent instrument rather than a tests/
-# artifact, so nothing outside W2 is affected — but the dependency points
-# the wrong way. When W4's real generator lands it will signal exhaustion
-# some other way, and the right fix is an agreed exception declared beside
-# GeneratorPort in ports.py. Left as-is here only because ports.py and
-# fakes.py are out of scope for this change.
-from controller.fakes import ScriptExhaustedError
+from controller.ports import (
+    ExecutorPort,
+    GatePort,
+    GeneratorExhausted,
+    GeneratorPort,
+    JournalPort,
+    RealizerExhausted,
+    RealizerPort,
+)
 from controller.state import (
     RunState,
     STAGE_ORDER,
@@ -63,7 +63,16 @@ from controller.state import (
     next_stage,
 )
 
-__all__ = ["BASELINE_SLOTS", "Controller", "baseline_pipeline"]
+__all__ = ["BASELINE_SLOTS", "UNREALIZED_CONFIG_ID", "Controller", "baseline_pipeline"]
+
+UNREALIZED_CONFIG_ID = "<unrealized>"
+"""Stands in for a candidate the realizer could not produce.
+
+`HistoryEntry.config_id` is a str, and a hypothesis that never became a
+config has no content to hash. A visible sentinel beats an empty string:
+in the state card's `recent_history` it reads as an explicit "this attempt
+produced nothing", rather than as a value someone forgot to fill in.
+"""
 
 
 BASELINE_SLOTS: dict[str, SlotConfig] = {
@@ -109,6 +118,7 @@ class Controller:
         executor: ExecutorPort,
         gate: GatePort,
         generator: GeneratorPort,
+        realizer: RealizerPort,
         journal: JournalPort,
         budget: Optional[Budget] = None,
         seeds: Sequence[int] = (0,),
@@ -118,6 +128,11 @@ class Controller:
         self._executor = executor
         self._gate = gate
         self._generator = generator
+        # Required, never defaulted. A default realizer would silently
+        # supply the very wiring this seam exists to make explicit, and a
+        # caller who forgot to pass one would get a working run built on a
+        # component they never chose.
+        self._realizer = realizer
         self._journal = journal
         # An unlimited Budget by default. No agreed wall-clock, token or
         # evaluation ceiling exists anywhere in the repo yet, and inventing
@@ -207,7 +222,7 @@ class Controller:
 
             try:
                 state = self._attempt(state, stage)
-            except ScriptExhaustedError as exc:
+            except GeneratorExhausted as exc:
                 # Running out of scripted hypotheses is a normal end to a
                 # test run, not a crash. Ending through the ordinary
                 # finalisation path means the journal still gets its
@@ -239,7 +254,29 @@ class Controller:
         else:
             payload = self._generator.propose(build_state_card(state))
             self._emit(state, EventKind.HYPOTHESIS, asdict(payload))
-            config = self._config_from_hypothesis(state, payload)
+            try:
+                config = self._realize(state, payload)
+            except RealizerExhausted as exc:
+                # A hypothesis that cannot be turned into runnable code is
+                # a dead candidate, not a dead run — absorbing exactly this
+                # kind of localized failure is what the architecture is
+                # for. Classified CONTRACT because the realizer failed to
+                # honour its side of RealizerPort: it was asked for a
+                # SlotConfig and could not produce one.
+                self._emit(
+                    state,
+                    EventKind.ERROR,
+                    {
+                        "config_id": UNREALIZED_CONFIG_ID,
+                        "reason": "realizer_exhausted",
+                        "target_slot": payload.target_slot,
+                        "error_class": ErrorClass.CONTRACT.value,
+                        "error_excerpt": str(exc),
+                    },
+                )
+                return state.with_outcome(
+                    UNREALIZED_CONFIG_ID, None, accepted=False
+                )
 
         self._emit(
             state,
@@ -342,35 +379,56 @@ class Controller:
 
     # -- helpers -------------------------------------------------------
 
-    def _config_from_hypothesis(
+    def _realize(
         self, state: RunState, payload: HypothesisPayload
     ) -> PipelineConfig:
-        """Turn a hypothesis into a runnable candidate.
+        """Realize the hypothesis into slot code, then splice it in.
 
-        KNOWN GAP, FLAGGED FOR W4: contracts.HypothesisPayload carries a
-        `target_slot` and a citation, but **no proposed SlotConfig** — it
-        says which slot to change and why, never what to change it to. In
-        the finished system a CodeRealizer turns the hypothesis into a
-        SlotConfig; methods/ is empty and no such port exists yet.
+        Two steps, deliberately separate. RealizerPort produces a
+        SlotConfig for ONE slot; the Controller decides where that slot
+        sits, because only the Controller knows the current incumbent and
+        only it is answerable for candidate lineage.
 
-        So until it does, the implementation identifier is derived
-        deterministically from `citation.library_entry`, which is the
-        payload's only pointer into W4's method library. Deterministic
-        matters more than realistic here: the same hypothesis must always
-        produce the same config_id, or caching and dedup become
-        meaningless. Params are left empty because nothing in the payload
-        carries them.
+        WHY parent_id MATTERS: it records which incumbent this candidate
+        was derived from, so a reader holding nothing but the journal can
+        reconstruct the whole search tree - which experiment branched from
+        which, and where a winning line actually started. Without it the
+        log is a flat list of configs with no ancestry and "how did we get
+        here" is unanswerable after the fact. It is deliberately NOT part
+        of the content hash (config_id hashes slots only), so recording
+        lineage never perturbs a candidate's identity or its cache key:
+        two runs reaching the same config by different routes still share
+        cached artifacts.
 
-        The candidate is the incumbent with one slot swapped — a one-slot
-        diff, which is what makes the cascading slot_hash reuse pay off.
+        The candidate is the incumbent with exactly one slot swapped. That
+        one-slot diff is what makes the cascading slot_hash reuse pay off -
+        everything upstream of the changed slot keeps its cached artifact.
         """
+        slot_config = self._realizer.realize(payload)
+
+        self._emit(
+            state,
+            EventKind.CODE_EMITTED,
+            {
+                "target_slot": payload.target_slot,
+                "impl": slot_config.impl,
+                # Presence and size only, never the blob. A journal that
+                # inlines generated source stops being readable and can
+                # balloon one JSONL line past anything a human will scroll
+                # through - and the code is already content-addressed
+                # inside the config, so the log does not need a second copy.
+                "has_code_blob": slot_config.code_blob is not None,
+                "code_blob_chars": len(slot_config.code_blob or ""),
+            },
+        )
+
         base = (
             state.incumbent_config.slots
             if state.incumbent_config is not None
             else BASELINE_SLOTS
         )
         slots = dict(base)
-        slots[payload.target_slot] = SlotConfig(impl=payload.citation.library_entry)
+        slots[payload.target_slot] = slot_config
         return PipelineConfig(
             slots=slots,
             parent_id=(

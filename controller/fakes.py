@@ -28,9 +28,16 @@ from contracts import (
     JournalEvent,
     Metrics,
     PipelineConfig,
+    SlotConfig,
     Status,
     Verdict,
 )
+
+# The doubles raise the port-level exceptions, not private ones of their own.
+# That is the whole point of the hierarchy: the Controller catches the port
+# contract, so swapping a double for W4's real component changes nothing
+# about how failure is handled.
+from controller.ports import GeneratorExhausted, RealizerExhausted
 
 __all__ = [
     "BASELINE_GAUC",
@@ -39,11 +46,13 @@ __all__ = [
     "BASELINE_SIGMA",
     "AlwaysAcceptGate",
     "AlwaysRejectGate",
+    "DeterministicRealizer",
     "FakeExecutor",
     "FailureHook",
     "InMemoryJournal",
     "ScriptExhaustedError",
     "ScriptedGenerator",
+    "ScriptedRealizer",
     "mean_primary",
     "metrics_from_delta",
 ]
@@ -255,8 +264,19 @@ class FakeExecutor:
 # ---------------------------------------------------------------------------
 
 
-class ScriptExhaustedError(RuntimeError):
-    """Raised when a ScriptedGenerator is asked for one hypothesis too many."""
+class ScriptExhaustedError(GeneratorExhausted):
+    """Raised when a ScriptedGenerator is asked for one hypothesis too many.
+
+    WHY IT SUBCLASSES GeneratorExhausted AND STILL LIVES HERE: the name is
+    fake-specific and belongs with the fake, but the Controller must never
+    import it. Reparenting onto the port-level exception lets the
+    Controller catch `ports.GeneratorExhausted` and handle a scripted
+    double and W4's real generator through one code path, which removed a
+    production-code dependency on this module.
+
+    It remains a RuntimeError by inheritance, so any handler written
+    against the old base still catches it.
+    """
 
 
 class ScriptedGenerator:
@@ -300,6 +320,76 @@ class ScriptedGenerator:
     @property
     def remaining(self) -> int:
         """Hypotheses left in the script."""
+        return len(self._script) - self._index
+
+
+# ---------------------------------------------------------------------------
+# RealizerPort doubles
+# ---------------------------------------------------------------------------
+
+
+class DeterministicRealizer:
+    """Realizes a hypothesis into a SlotConfig with no script to maintain.
+
+    The default realizer double, and the one most tests should use. A test
+    that only cares about the loop should not have to keep a hypothesis
+    script and a config script in lockstep - an off-by-one between the two
+    is a test bug that looks exactly like a Controller bug, and costs an
+    afternoon to tell apart.
+
+    WHAT GOES INTO THE CONFIG, AND WHAT POINTEDLY DOES NOT: `impl` comes
+    from `citation.library_entry`, the payload's pointer into the method
+    library, and `params` carries only `citation.key`. Identity-bearing
+    fields only. `expected_gain` and `expected_cost_s` are excluded even
+    though they sit right there on the payload, because they are advisory
+    forecasts - folding a forecast into `params` folds it into the content
+    hash, so two identical proposals that merely disagreed about how much
+    they would help would produce two different config_ids and quietly
+    defeat both caching and dedup.
+
+    Emits no code_blob: this models a registry-backed realization, where
+    the implementation already exists in the library and only needs
+    selecting. Use ScriptedRealizer when a test needs freeform code.
+    """
+
+    def realize(self, hypothesis: HypothesisPayload) -> SlotConfig:
+        return SlotConfig(
+            impl=hypothesis.citation.library_entry,
+            params={"method_key": hypothesis.citation.key},
+        )
+
+
+class ScriptedRealizer:
+    """Returns a fixed, ordered list of SlotConfigs. For exact control.
+
+    Does not cycle, for the same reason ScriptedGenerator does not:
+    wrapping around would hide a Controller that iterated more times than
+    the test intended. Exhaustion raises `RealizerExhausted` - the
+    port-level exception - so a test exercises the same handling path the
+    Controller will use when W4's real realizer gives up on a hypothesis.
+    """
+
+    def __init__(self, script: Sequence[SlotConfig]) -> None:
+        self._script = tuple(script)
+        self._index = 0
+        self.calls: list[HypothesisPayload] = []
+        """Every hypothesis handed in, in order, so a test can assert on
+        what the Controller actually asked to have realized."""
+
+    def realize(self, hypothesis: HypothesisPayload) -> SlotConfig:
+        self.calls.append(hypothesis)
+        if self._index >= len(self._script):
+            raise RealizerExhausted(
+                f"ScriptedRealizer exhausted after {len(self._script)} "
+                f"configs; the Controller asked for one more"
+            )
+        config = self._script[self._index]
+        self._index += 1
+        return config
+
+    @property
+    def remaining(self) -> int:
+        """SlotConfigs left in the script."""
         return len(self._script) - self._index
 
 

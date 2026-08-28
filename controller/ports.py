@@ -50,15 +50,69 @@ from contracts import (
     HypothesisPayload,
     JournalEvent,
     PipelineConfig,
+    SlotConfig,
     Verdict,
 )
 
 __all__ = [
     "ExecutorPort",
     "GatePort",
+    "GeneratorExhausted",
     "GeneratorPort",
     "JournalPort",
+    "PortExhausted",
+    "RealizerExhausted",
+    "RealizerPort",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Port-level exceptions
+#
+# WHY THESE LIVE BESIDE THE PROTOCOLS: any implementation of a port may run
+# out of work or refuse a request - a scripted double runs off the end of its
+# script, a real generator decides it has nothing left worth trying, a
+# realizer cannot turn a hypothesis into runnable code. The Controller has to
+# catch that, and it must be able to do so WITHOUT importing from any
+# particular implementation - least of all from the test doubles, which is
+# exactly the dependency this hierarchy exists to remove.
+#
+# Declaring them next to the Protocols also completes the contract: a port is
+# its method signatures AND the exceptions it is permitted to raise. An
+# implementor reading this file sees both halves in one place.
+# ---------------------------------------------------------------------------
+
+
+class PortExhausted(RuntimeError):
+    """Base: a port has no further work to offer for this request.
+
+    Subclasses RuntimeError rather than Exception so that existing broad
+    handlers behave as they did, and because that is what this is - a
+    runtime condition of a collaborator, not a programming error in the
+    Controller.
+
+    Not raised directly. Catch this to mean "some port gave up"; catch a
+    subclass to distinguish which one and how much it costs.
+    """
+
+
+class GeneratorExhausted(PortExhausted):
+    """The generator has no further hypothesis to offer.
+
+    A normal end to a run rather than a crash: the Controller finalises
+    through its ordinary path, so the journal still receives FINALIZE and
+    RUN_END and a replay can tell the run finished rather than died.
+    """
+
+
+class RealizerExhausted(PortExhausted):
+    """The realizer cannot turn this hypothesis into a SlotConfig.
+
+    Deliberately NOT fatal to the run. One hypothesis that cannot be
+    realised is a localized failure, and absorbing exactly that is what
+    the architecture is for - so the Controller logs it, counts the node
+    and moves on to the next candidate.
+    """
 
 
 @runtime_checkable
@@ -131,6 +185,32 @@ class GeneratorPort(Protocol):
         The returned `expected_gain` is advisory only — see
         HypothesisPayload's docstring. The Controller may use it to order
         the queue; it must never let it influence acceptance.
+        """
+        ...
+
+
+@runtime_checkable
+class RealizerPort(Protocol):
+    """Turns a hypothesis into runnable slot code (W4). LLM call #2.
+
+    The second half of the two-model split that makes the project's cost
+    story reportable: a strong model proposes *what* to change and why
+    (GeneratorPort), and a cheap model writes the code that does it. Two
+    roles, two models, two token budgets, separately accountable in the
+    run's cost breakdown - which is only possible if they are two seams
+    rather than one.
+    """
+
+    def realize(self, hypothesis: HypothesisPayload) -> SlotConfig:
+        """Produce a SlotConfig for `hypothesis.target_slot` - that slot ONLY.
+
+        The realizer returns one slot's configuration, never a whole
+        pipeline. Splicing it into the incumbent is the Controller's job,
+        because only the Controller knows what the incumbent currently is,
+        and it is the component answerable for candidate lineage.
+
+        May raise RealizerExhausted when the hypothesis cannot be turned
+        into runnable code. That ends the candidate, never the run.
         """
         ...
 

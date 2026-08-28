@@ -487,3 +487,135 @@ def test_metrics_helper_matches_contracts_metrics_semantics() -> None:
     direct = Metrics(values={"GAUC": BASELINE_GAUC, "nDCG@5": BASELINE_NDCG5})
     assert metrics_from_delta(0.0) == direct
     assert direct.primary == pytest.approx(BASELINE_PRIMARY)
+
+
+# ---------------------------------------------------------------------------
+# RealizerPort doubles — appended. Nothing above this line is modified.
+# ---------------------------------------------------------------------------
+
+from controller.fakes import DeterministicRealizer, ScriptedRealizer
+from controller.ports import (
+    GeneratorExhausted,
+    PortExhausted,
+    RealizerExhausted,
+    RealizerPort,
+)
+from contracts import SlotConfig
+
+
+def _payload(index: int, slot: str = "model") -> HypothesisPayload:
+    return HypothesisPayload(
+        target_slot=slot,
+        rationale=f"candidate {index}",
+        citation=Citation(
+            key=f"paper{index}",
+            url=f"https://example.invalid/{index}",
+            library_entry=f"lib/impl_{index}",
+        ),
+        expected_gain=0.003,
+        expected_cost_s=40.0,
+    )
+
+
+def test_realizer_doubles_satisfy_the_port():
+    assert isinstance(DeterministicRealizer(), RealizerPort)
+    assert isinstance(ScriptedRealizer([]), RealizerPort)
+    # Negative check, so the two above are not vacuous: a realizer has
+    # `realize` and not `compare`, so it must not satisfy GatePort.
+    assert not isinstance(DeterministicRealizer(), GatePort)
+    assert not isinstance(AlwaysAcceptGate(), RealizerPort)
+
+
+def test_deterministic_realizer_is_deterministic():
+    """Same hypothesis in, equal SlotConfig out — every time. Without this
+    a candidate's config_id would wander between runs and caching would be
+    meaningless."""
+    realizer = DeterministicRealizer()
+    hypothesis = _payload(1)
+
+    first = realizer.realize(hypothesis)
+    second = realizer.realize(hypothesis)
+    third = DeterministicRealizer().realize(hypothesis)
+
+    assert first == second == third
+    assert first.impl == "lib/impl_1"
+    assert first.params == {"method_key": "paper1"}
+    assert first.code_blob is None
+
+
+def test_deterministic_realizer_separates_different_hypotheses():
+    realizer = DeterministicRealizer()
+    assert realizer.realize(_payload(1)) != realizer.realize(_payload(2))
+    assert realizer.realize(_payload(1)).canonical() != realizer.realize(
+        _payload(2)
+    ).canonical()
+
+
+def test_deterministic_realizer_excludes_advisory_forecasts_from_the_config():
+    """expected_gain is a forecast, not identity. Folding it into params
+    would fold it into the content hash, so two identical proposals that
+    merely disagreed about how much they would help would look like two
+    different candidates."""
+    base = _payload(1)
+    optimistic = HypothesisPayload(
+        target_slot=base.target_slot,
+        rationale=base.rationale,
+        citation=base.citation,
+        expected_gain=0.5,          # wildly different forecast
+        expected_cost_s=9999.0,     # wildly different cost estimate
+    )
+
+    realizer = DeterministicRealizer()
+    assert realizer.realize(base) == realizer.realize(optimistic)
+
+
+def test_scripted_realizer_returns_configs_in_order_and_records_calls():
+    script = [
+        SlotConfig(impl="a"),
+        SlotConfig(impl="b"),
+        SlotConfig(impl="c"),
+    ]
+    realizer = ScriptedRealizer(script)
+
+    returned = [realizer.realize(_payload(i)) for i in range(3)]
+
+    assert returned == script
+    assert [h.citation.key for h in realizer.calls] == ["paper0", "paper1", "paper2"]
+    assert realizer.remaining == 0
+
+
+def test_scripted_realizer_raises_realizer_exhausted_rather_than_cycling():
+    realizer = ScriptedRealizer([SlotConfig(impl="only")])
+    realizer.realize(_payload(0))
+
+    with pytest.raises(RealizerExhausted):
+        realizer.realize(_payload(1))
+
+    # The hypothesis it could not realize is still recorded.
+    assert len(realizer.calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# The reparenting: fake-specific name, port-level base
+# ---------------------------------------------------------------------------
+
+
+def test_script_exhausted_error_is_catchable_as_the_port_exceptions():
+    """THE test that proves the reparenting worked. The Controller catches
+    GeneratorExhausted and must never import this class."""
+    assert issubclass(ScriptExhaustedError, GeneratorExhausted)
+    assert issubclass(ScriptExhaustedError, PortExhausted)
+    assert issubclass(ScriptExhaustedError, RuntimeError)  # old base still holds
+
+    generator = ScriptedGenerator([])
+
+    with pytest.raises(GeneratorExhausted):
+        generator.propose({})
+    with pytest.raises(PortExhausted):
+        ScriptedGenerator([]).propose({})
+
+
+def test_the_two_exhaustion_kinds_do_not_catch_each_other():
+    """A realizer giving up must not be mistaken for the run being over."""
+    assert not issubclass(RealizerExhausted, GeneratorExhausted)
+    assert not issubclass(GeneratorExhausted, RealizerExhausted)
