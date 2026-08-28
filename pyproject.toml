@@ -1,0 +1,12 @@
+# Test/tool configuration only.
+#
+# Deliberately no [project] or [build-system] table: the repo is a set of
+# sibling top-level packages imported from the repo root, not an
+# installable distribution. Adding packaging metadata here would change
+# how every module imports, which is out of scope.
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
