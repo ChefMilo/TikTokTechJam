@@ -283,15 +283,57 @@ class CostAwareBanditPolicy:
     cost", not "per unit of cost". When a port reports proposal tokens,
     HistoryEntry is where the number goes and this class needs no change.
 
-    `exploration_c` MUST BE TUNED TO THE PROBLEM'S SCALE, and the default
-    of 1.0 does not do that. The exploitation term here is O(0.02) while
-    sqrt(ln T / n) is O(1) for small T, so at c = 1.0 the bonus dominates
-    by roughly two orders of magnitude and this policy degenerates into
-    round-robin - a differently-spelled uniform. The default is kept at 1.0
-    because that is textbook UCB1 and a silently "helpful" default would
-    hide the mismatch; a caller who wants exploitation to matter must pick
-    c against the delta-per-1k-token scale they actually observe (~0.01 for
-    this benchmark). The ablation test states its own choice and why.
+    `exploration_c` IS TUNED TO THIS BENCHMARK'S SCALE - HOW TO RE-DERIVE IT
+    ------------------------------------------------------------------------
+    The default is 0.005, not the textbook UCB1 value of 1.0. That is not a
+    preference, it is arithmetic, and the arithmetic is written out here so
+    a reader can redo it for another problem instead of inheriting a magic
+    constant.
+
+    The two terms of the score are not automatically commensurable, and
+    nothing in the formula makes them so:
+
+      - THE EXPLOITATION TERM is improvement per 1000 tokens (see
+        TOKENS_PER_UNIT). Its size is a property of the BENCHMARK. Here an
+        improvement worth having is around epsilon = 0.002 on the primary,
+        and a candidate costs on the order of 1e3 tokens to evaluate, so
+        the term lands around 0.002 per 1k tokens - order 1e-3, reaching
+        1e-2 for an unusually strong arm.
+
+      - THE UCB BONUS is `sqrt(ln T / n)`, which is a property of the
+        COUNTS ALONE. It is order 1 for any small T and n - about 1.3 at
+        T = 5, n = 1, and still about 0.4 after twenty pulls - and it stays
+        order 1 whatever the metric, the cost model, or the units.
+
+    So one side is 1e-3 and the other is 1e0, and `exploration_c` is the
+    only thing standing between them. It has to be the same order as the
+    exploitation term or one side decides every choice on its own: at
+    c = 1.0 the bonus sits roughly two to three orders of magnitude above
+    the signal, every arm's score is its exploration bonus, and the policy
+    round-robins - a differently-spelled uniform, which is the one thing a
+    bandit must not be. At c = 0 it never explores and locks onto whatever
+    the initialisation pass happened to favour.
+
+    0.005 was chosen BY MEASUREMENT, NOT BY TASTE, and the measurement is
+    in the repo. tests/test_controller.py::
+    test_the_bandit_pulls_the_good_arm_far_more_often_than_uniform runs this
+    policy AS SHIPPED against UniformPolicy over the same seeded
+    configuration and requires a wide margin on the good arm;
+    ::test_at_the_textbook_exploration_constant_the_bandit_matches_uniform
+    passes c = 1.0 explicitly and pins the failure, so the claim that the
+    textbook value does not work here cannot quietly rot out of this
+    docstring. Both must keep passing for this default to mean anything.
+
+    RE-DERIVE IT FOR ANOTHER PROBLEM rather than porting it. The number
+    encodes this benchmark's metric scale and this executor's cost
+    profile, and either can move it by orders of magnitude. A metric whose
+    meaningful deltas are O(1) rather than O(1e-3) - a raw count, a
+    percentage, anything not a probability-scale ranking metric - or a cost
+    profile in the millions of tokens rather than the thousands, would need
+    a different constant. The recipe: take the improvement a run would be
+    pleased with, divide by the tokens a candidate costs, multiply by 1000,
+    and start there. That is the scale of the exploitation term, and the
+    exploration constant belongs at the same order.
 
     DETERMINISM. The RNG is instance-owned, never the global module, and is
     consulted only for a residual tie SLOT_ORDER cannot break. Given the
@@ -302,7 +344,13 @@ class CostAwareBanditPolicy:
     def __init__(
         self,
         seed: int = 0,
-        exploration_c: float = 1.0,
+        # 0.005, not textbook UCB1's 1.0. The exploitation term is
+        # improvement-per-1k-tokens, order 1e-3 on this benchmark, while
+        # sqrt(ln T / n) is order 1 on any benchmark - so a constant of 1.0
+        # buries the signal under the bonus and the policy round-robins.
+        # Tuned to THIS problem's scale and measured by the ablation test;
+        # see the class docstring to re-derive it for another one.
+        exploration_c: float = 0.005,
         cost_floor_tokens: float = 1.0,
     ) -> None:
         if cost_floor_tokens <= 0.0:

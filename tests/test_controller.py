@@ -1865,14 +1865,14 @@ def test_the_bandit_pulls_the_good_arm_far_more_often_than_uniform():
     leaves 16 informed pulls per stage, which is where the two policies can
     actually separate.
 
-    exploration_c = 0.005, and this number matters too - see
-    CostAwareBanditPolicy on why the default of 1.0 does not work here. The
-    exploitation term is delta-per-1k-tokens, about 0.017 for the good arm;
-    sqrt(ln T / n) is order 1. At c = 1.0 the bonus outruns the signal by
-    two orders of magnitude and the bandit round-robins. 0.005 puts the two
-    terms on the same footing at this scale. That is a finding about the
-    formula, not a thumb on the scale for the test: the same c is what a
-    real run on this benchmark would need.
+    THE POLICY IS BUILT WITH NO ARGUMENTS BUT ITS SEED, and that is the
+    point of the test rather than an incidental tidiness. An ablation that
+    had to hand-tune `exploration_c` would only prove that SOME
+    configuration of this policy beats uniform, which is a much weaker
+    claim than the one being made - and it would leave the shipped default
+    unmeasured, so a real run that forgot the override would get uniform
+    selection under a bandit's name. What is on trial here is the policy as
+    a caller actually receives it.
 
     AlwaysRejectGate so the incumbent never moves, which keeps every
     candidate measured against the same reference and stops convergence
@@ -1894,7 +1894,8 @@ def test_the_bandit_pulls_the_good_arm_far_more_often_than_uniform():
         ).run()
         return generator.requested_slots.count("weighting")
 
-    bandit = run(CostAwareBanditPolicy(seed=0, exploration_c=0.005))
+    # No `exploration_c`: the shipped default is what is under test.
+    bandit = run(CostAwareBanditPolicy(seed=0))
     uniform = run(UniformPolicy(seed=0))
 
     # A margin, not an exact count. Measured over a grid of executor and
@@ -1913,11 +1914,17 @@ def test_at_the_textbook_exploration_constant_the_bandit_matches_uniform():
     """THE HONEST COUNTERPART to the ablation above, pinned so nobody
     over-claims from it.
 
-    At the default exploration_c = 1.0 the bonus dominates the
-    delta-per-1k-token signal and the bandit degenerates into round-robin —
-    it pulls the good arm about as often as uniform does. The bandit is a
-    result only when c is chosen against the reward scale, and this test
-    exists so that caveat cannot quietly rot out of the docstring.
+    At exploration_c = 1.0 — textbook UCB1, and what this policy used to
+    ship with — the bonus dominates the delta-per-1k-token signal and the
+    bandit degenerates into round-robin, pulling the good arm about as
+    often as uniform does. It is passed EXPLICITLY here: 1.0 is no longer
+    the default, precisely because of what this test measures.
+
+    This is the evidence for that default being 0.005 rather than a matter
+    of taste, and it is why the constant cannot be ported to another
+    problem unexamined — a bandit whose exploration constant is off the
+    scale of its own reward is its own control. Keeping the failure
+    executable stops that caveat quietly rotting out of the docstring.
     """
     def run(policy) -> int:
         generator = ScriptedGenerator(_script(80))
@@ -1930,16 +1937,16 @@ def test_at_the_textbook_exploration_constant_the_bandit_matches_uniform():
             journal=InMemoryJournal(),
             seeds=(0, 1, 2),
             max_nodes_per_stage=20,
-            run_id="ablation-default-c",
+            run_id="ablation-textbook-c",
         ).run()
         return generator.requested_slots.count("weighting")
 
-    default_c = run(CostAwareBanditPolicy(seed=0, exploration_c=1.0))
+    textbook_c = run(CostAwareBanditPolicy(seed=0, exploration_c=1.0))
     uniform = run(UniformPolicy(seed=0))
 
-    assert abs(default_c - uniform) <= 5
+    assert abs(textbook_c - uniform) <= 5
     # Far short of what the tuned constant achieves in the test above.
-    assert default_c < 20
+    assert textbook_c < 20
 
 
 # -- the breaker fires on executor failures -----------------------------
