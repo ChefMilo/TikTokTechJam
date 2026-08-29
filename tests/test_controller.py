@@ -34,9 +34,10 @@ from controller.fakes import (
     InMemoryJournal,
     ScriptedGenerator,
     ScriptedRealizer,
+    SlotSensitiveExecutor,
     metrics_from_delta,
 )
-from controller.policy import FixedOrderPolicy, UniformPolicy
+from controller.policy import CostAwareBanditPolicy, FixedOrderPolicy, UniformPolicy
 from controller.ports import RealizerExhausted
 from controller import convergence
 from controller.state import (
@@ -151,6 +152,7 @@ def _controller(
     budget=None,
     run_id="run-test",
     max_nodes_per_stage=MAX_NODES_PER_STAGE,
+    failures_before_block=2,
 ) -> tuple[Controller, InMemoryJournal]:
     journal = journal if journal is not None else InMemoryJournal()
     controller = Controller(
@@ -169,6 +171,7 @@ def _controller(
         journal=journal,
         budget=budget,
             max_nodes_per_stage=max_nodes_per_stage,
+        failures_before_block=failures_before_block,
         run_id=run_id,
     )
     return controller, journal
@@ -292,6 +295,12 @@ def test_state_card_has_the_documented_keys_and_is_strict_json():
         "incumbent_config_id",
         "incumbent_primary",
         "recent_history",
+        # FLAGGED ADDITION (bandit PR): the per-slot aggregate the
+        # cost-aware policy scores arms on. An addition, not a rename —
+        # every key above and below is unchanged, so nothing coded against
+        # the old shape breaks. See build_state_card for why it goes on the
+        # card rather than through a side channel.
+        "slot_stats",
         "blocked_slots",
         "budget_remaining",
         "convergence",
@@ -1105,7 +1114,7 @@ from contracts import SLOT_ORDER, Verdict
 from controller.controller import MISPROPOSED_CONFIG_ID, UNREALIZED_CONFIG_ID
 from controller.fakes import BASELINE_SIGMA, DisobedientGenerator
 from controller.ports import PolicyContractError, PortExhausted
-from controller.state import SlotStats, slot_stats
+from controller.state import SlotStats, slot_stats, slot_stats_as_json
 
 STRUCTURAL_ORDER = ("features", "weighting", "model", "objective")
 
@@ -1280,6 +1289,7 @@ def test_the_generator_never_sees_the_slot_twice_via_the_state_card():
         "incumbent_config_id",
         "incumbent_primary",
         "recent_history",
+        "slot_stats",  # FLAGGED ADDITION (bandit PR) — see the test above.
         "blocked_slots",
         "budget_remaining",
         "convergence",
@@ -1752,3 +1762,697 @@ def test_a_uniform_policy_run_still_reaches_done():
     assert state.stage is Stage.DONE
     assert state.node == TOTAL_CANDIDATES
     assert _kinds(journal)[-1] == EventKind.RUN_END.value
+
+
+# ---------------------------------------------------------------------------
+# The circuit breaker, and the cost-aware bandit's ablation
+# ---------------------------------------------------------------------------
+
+
+class _StickyPolicy:
+    """Selects `preferred` whenever it is offered, else the first candidate.
+
+    FixedOrderPolicy raises when its order shares no slot with the offered
+    set, which is exactly what happens the moment the circuit breaker
+    blocks the slot these tests are pinned to - so a blocking test written
+    against it would fail on the policy rather than on the mechanism under
+    test. This falls back instead, which is what makes "kept attacking one
+    slot until it was blocked, then moved on" expressible.
+
+    `offered` records every candidate set it was handed, in order. That is
+    the assertion surface for both halves of the contract: a blocked slot
+    stops being offered, and the Controller never calls a policy with an
+    empty set.
+    """
+
+    def __init__(self, preferred: str) -> None:
+        self.preferred = preferred
+        self.offered: list[tuple[str, ...]] = []
+
+    def select_slot(self, state_card, candidate_slots):
+        self.offered.append(tuple(candidate_slots))
+        if self.preferred in candidate_slots:
+            return self.preferred
+        return candidate_slots[0]
+
+
+def _fails_on_slot(slot: str, times: int = 10**6):
+    """A FailureHook that fails candidates whose `slot` left the baseline.
+
+    Compared against BASELINE_SLOTS rather than against the incumbent: a
+    candidate for a failing slot never gets accepted, so the incumbent
+    never carries that slot's change and the two readings coincide - but
+    naming the baseline says what is meant without depending on that.
+
+    `times` caps how many failures it produces, so a test can make a slot
+    fail, recover, and fail again.
+    """
+    fired = {"n": 0}
+
+    def hook(config):
+        if config.slots.get(slot) == BASELINE_SLOTS[slot]:
+            return None
+        if fired["n"] >= times:
+            return None
+        fired["n"] += 1
+        return (ErrorClass.OOM, f"synthetic OOM realizing {slot}")
+
+    return hook
+
+
+def _fails_on_any_search_candidate():
+    """Fails every candidate that differs from the baseline anywhere.
+
+    The fixture for "a whole stage's arms go down one after another",
+    which is the only way the fully-blocked path is reached from a real
+    run rather than from a hand-built RunState.
+    """
+
+    def hook(config):
+        if any(config.slots.get(s) != BASELINE_SLOTS[s] for s in BASELINE_SLOTS):
+            return (ErrorClass.OOM, "synthetic OOM")
+        return None
+
+    return hook
+
+
+def _blocks(journal: InMemoryJournal) -> list:
+    """SLOT_BLOCKED events that blocked a slot, not the ones that ended a
+    stage because everything was already blocked."""
+    return [
+        e
+        for e in journal.events_of_kind(EventKind.SLOT_BLOCKED)
+        if e.payload.get("action") == "block_slot"
+    ]
+
+
+# -- DECISION 4: the ablation ------------------------------------------
+
+
+def test_the_bandit_pulls_the_good_arm_far_more_often_than_uniform():
+    """THE ABLATION. A bandit that cannot be shown to differ from its own
+    control is not evidence of anything, so this runs both policies over
+    the same seeded configuration and compares.
+
+    GROUND TRUTH: SlotSensitiveExecutor makes `weighting` genuinely worth
+    +0.02 primary and every other slot pure noise at the measured sigma of
+    0.0008 - a 25-sigma effect, so the ranking is not a coin flip.
+
+    max_nodes_per_stage = 20, and the number matters. Stage one offers four
+    arms, so the bandit spends its first four attempts on the mandatory
+    initialisation pass; at the default of 3 it would never finish that
+    pass and would be a differently-seeded uniform by construction. 20
+    leaves 16 informed pulls per stage, which is where the two policies can
+    actually separate.
+
+    exploration_c = 0.005, and this number matters too - see
+    CostAwareBanditPolicy on why the default of 1.0 does not work here. The
+    exploitation term is delta-per-1k-tokens, about 0.017 for the good arm;
+    sqrt(ln T / n) is order 1. At c = 1.0 the bonus outruns the signal by
+    two orders of magnitude and the bandit round-robins. 0.005 puts the two
+    terms on the same footing at this scale. That is a finding about the
+    formula, not a thumb on the scale for the test: the same c is what a
+    real run on this benchmark would need.
+
+    AlwaysRejectGate so the incumbent never moves, which keeps every
+    candidate measured against the same reference and stops convergence
+    ending one policy's run earlier than the other's. Rejected attempts
+    still carry a gate delta, so the bandit still learns.
+    """
+    def run(policy) -> int:
+        generator = ScriptedGenerator(_script(80))
+        Controller(
+            executor=SlotSensitiveExecutor("weighting", effect=0.02, seed=7),
+            gate=AlwaysRejectGate(),
+            generator=generator,
+            realizer=DeterministicRealizer(),
+            policy=policy,
+            journal=InMemoryJournal(),
+            seeds=(0, 1, 2),
+            max_nodes_per_stage=20,
+            run_id="ablation",
+        ).run()
+        return generator.requested_slots.count("weighting")
+
+    bandit = run(CostAwareBanditPolicy(seed=0, exploration_c=0.005))
+    uniform = run(UniformPolicy(seed=0))
+
+    # A margin, not an exact count. Measured over a grid of executor and
+    # uniform seeds the smallest gap was 29; 20 sits well inside that
+    # without being so loose that a regression to round-robin would pass.
+    assert bandit >= uniform + 20, (
+        f"bandit pulled the good arm {bandit} times, uniform {uniform} — "
+        f"the bandit is not distinguishable from its own control"
+    )
+    # And the absolute claim, so a future change that made BOTH bad still
+    # fails: the bandit spends most of the run on the arm that works.
+    assert bandit > 40
+
+
+def test_at_the_textbook_exploration_constant_the_bandit_matches_uniform():
+    """THE HONEST COUNTERPART to the ablation above, pinned so nobody
+    over-claims from it.
+
+    At the default exploration_c = 1.0 the bonus dominates the
+    delta-per-1k-token signal and the bandit degenerates into round-robin —
+    it pulls the good arm about as often as uniform does. The bandit is a
+    result only when c is chosen against the reward scale, and this test
+    exists so that caveat cannot quietly rot out of the docstring.
+    """
+    def run(policy) -> int:
+        generator = ScriptedGenerator(_script(80))
+        Controller(
+            executor=SlotSensitiveExecutor("weighting", effect=0.02, seed=7),
+            gate=AlwaysRejectGate(),
+            generator=generator,
+            realizer=DeterministicRealizer(),
+            policy=policy,
+            journal=InMemoryJournal(),
+            seeds=(0, 1, 2),
+            max_nodes_per_stage=20,
+            run_id="ablation-default-c",
+        ).run()
+        return generator.requested_slots.count("weighting")
+
+    default_c = run(CostAwareBanditPolicy(seed=0, exploration_c=1.0))
+    uniform = run(UniformPolicy(seed=0))
+
+    assert abs(default_c - uniform) <= 5
+    # Far short of what the tuned constant achieves in the test above.
+    assert default_c < 20
+
+
+# -- the breaker fires on executor failures -----------------------------
+
+
+def test_k_consecutive_executor_failures_block_the_slot():
+    policy = _StickyPolicy("model")
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(fail_on=_fails_on_slot("model")),
+        policy=policy,
+        max_nodes_per_stage=4,
+        failures_before_block=2,
+    )
+    state = RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL)
+
+    ended, stop_reason = controller._run_stage(state, Stage.STAGE_1_STRUCTURAL)
+
+    assert stop_reason is None  # a blocked slot ends nothing
+    blocked = _blocks(journal)
+    assert len(blocked) == 1
+    assert blocked[0].payload["slot"] == "model"
+    assert blocked[0].payload["consecutive_failures"] == 2
+    assert blocked[0].payload["threshold"] == 2
+    assert blocked[0].payload["stage"] == Stage.STAGE_1_STRUCTURAL.value
+    assert ended.blocked_slots == frozenset({"model"})
+
+
+def test_a_blocked_slot_is_removed_from_every_later_candidate_set():
+    policy = _StickyPolicy("model")
+    controller, _ = _controller(
+        executor=_ClimbingExecutor(fail_on=_fails_on_slot("model")),
+        policy=policy,
+        max_nodes_per_stage=5,
+        failures_before_block=2,
+    )
+    state = RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL)
+
+    controller._run_stage(state, Stage.STAGE_1_STRUCTURAL)
+
+    # Two pulls on `model`, then it is gone for the rest of the stage.
+    assert "model" in policy.offered[0]
+    assert "model" in policy.offered[1]
+    assert all("model" not in offer for offer in policy.offered[2:])
+    assert len(policy.offered) == 5
+
+
+def test_the_slot_blocked_event_is_distinguishable_from_the_stage_ending_one():
+    """Two different facts share the event kind; `action` separates them,
+    and a reader counting blocks must not accidentally count stage ends."""
+    policy = _StickyPolicy("model")
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(fail_on=_fails_on_slot("model")),
+        policy=policy,
+        max_nodes_per_stage=3,
+        failures_before_block=2,
+    )
+
+    controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL),
+        Stage.STAGE_1_STRUCTURAL,
+    )
+
+    actions = [
+        e.payload["action"] for e in journal.events_of_kind(EventKind.SLOT_BLOCKED)
+    ]
+    assert actions == ["block_slot"]
+
+
+def test_the_failure_error_event_still_precedes_the_block():
+    """Cause then consequence: the ERROR for the failure that tripped the
+    breaker is written before the SLOT_BLOCKED it caused."""
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(fail_on=_fails_on_slot("model")),
+        policy=_StickyPolicy("model"),
+        max_nodes_per_stage=2,
+        failures_before_block=2,
+    )
+
+    controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL),
+        Stage.STAGE_1_STRUCTURAL,
+    )
+
+    kinds = _kinds(journal)
+    assert kinds.index(EventKind.ERROR.value) < kinds.index(
+        EventKind.SLOT_BLOCKED.value
+    )
+
+
+def test_the_threshold_is_configurable_and_rejects_a_nonsense_value():
+    """A tunable, not a law — and one that must not be set below 1, which
+    would block a slot before it had failed at all."""
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(fail_on=_fails_on_slot("model")),
+        policy=_StickyPolicy("model"),
+        max_nodes_per_stage=4,
+        failures_before_block=3,
+    )
+
+    controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL),
+        Stage.STAGE_1_STRUCTURAL,
+    )
+
+    assert _blocks(journal)[0].payload["consecutive_failures"] == 3
+
+    with pytest.raises(ValueError, match="failures_before_block"):
+        _controller(failures_before_block=0)
+    with pytest.raises(ValueError, match="failures_before_block"):
+        _controller(failures_before_block=-1)
+
+
+def test_consecutive_failures_reset_after_a_success_on_that_slot():
+    """The counter measures a current run of failures, not a lifetime
+    total: a slot that failed, recovered and failed again is not one
+    attempt from being blocked."""
+    controller, journal = _controller(
+        # Fails the first `model` candidate only; every later one works.
+        executor=_ClimbingExecutor(fail_on=_fails_on_slot("model", times=1)),
+        policy=_StickyPolicy("model"),
+        max_nodes_per_stage=5,
+        failures_before_block=2,
+    )
+
+    ended, _ = controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL),
+        Stage.STAGE_1_STRUCTURAL,
+    )
+
+    assert _blocks(journal) == []
+    assert ended.blocked_slots == frozenset()
+    stats = slot_stats(ended)
+    assert stats["model"].attempts == 5
+    assert stats["model"].consecutive_failures == 0
+
+
+def test_the_counter_is_per_slot_not_run_wide():
+    """Two different slots failing once each must not add up to a block on
+    either. The run has two failures; no arm has two."""
+    model_hook = _fails_on_slot("model", times=1)
+    features_hook = _fails_on_slot("features", times=1)
+
+    def hook(config):
+        return model_hook(config) or features_hook(config)
+
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(fail_on=hook),
+        # Alternates between the two arms; each fails on its first pull and
+        # works thereafter, so the run accumulates two failures spread over
+        # two arms rather than two on one.
+        policy=FixedOrderPolicy(("model", "features")),
+        max_nodes_per_stage=4,
+        failures_before_block=2,
+    )
+
+    ended, _ = controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL),
+        Stage.STAGE_1_STRUCTURAL,
+    )
+
+    assert _blocks(journal) == []
+    assert sum(1 for e in ended.history if e.executor_failed) == 2
+    stats = slot_stats(ended)
+    assert stats["model"].consecutive_failures == 0  # reset by the success
+    assert stats["features"].consecutive_failures == 0
+
+
+def test_failures_on_one_slot_stay_consecutive_across_other_slots_pulls():
+    """"Consecutive" is within the ARM's own attempts, not within the run's.
+    Pulling a different slot in between does not launder a failing arm's
+    record — the fold is per-slot, and an interleaved good result on some
+    other slot says nothing about this one."""
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(fail_on=_fails_on_slot("model")),
+        # model, features, model, ... — the two model failures are not
+        # adjacent in history, but they are adjacent in `model`'s history.
+        policy=FixedOrderPolicy(("model", "features")),
+        max_nodes_per_stage=4,
+        failures_before_block=2,
+    )
+
+    ended, _ = controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL),
+        Stage.STAGE_1_STRUCTURAL,
+    )
+
+    blocked = _blocks(journal)
+    assert len(blocked) == 1
+    assert blocked[0].payload["slot"] == "model"
+    assert ended.blocked_slots == frozenset({"model"})
+    assert slot_stats(ended)["features"].consecutive_failures == 0
+
+
+# -- DECISION 1: what pointedly does NOT count --------------------------
+
+
+def test_generator_slot_mismatches_never_block_however_many_there_are():
+    """PINS DECISION 1. A generator that keeps naming the wrong slot is
+    W4's bug; blocking `model` over it would delete a good arm from this
+    run because another workstream's component misbehaved."""
+    generator = DisobedientGenerator(_script(12), wrong_slot="calibration")
+    controller, journal = _controller(
+        generator=generator,
+        policy=_StickyPolicy("model"),
+        max_nodes_per_stage=8,
+        failures_before_block=2,
+    )
+
+    ended, _ = controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL),
+        Stage.STAGE_1_STRUCTURAL,
+    )
+
+    assert _blocks(journal) == []
+    assert ended.blocked_slots == frozenset()
+    # Eight misproposals, all charged to the requested arm, none of them a
+    # failure — so the arm's record is bad but the arm is still in play.
+    assert slot_stats(ended)["model"].attempts == 8
+    assert slot_stats(ended)["model"].consecutive_failures == 0
+    assert all(e.executor_failed is False for e in ended.history)
+
+
+def test_realizer_exhaustions_never_block_however_many_there_are():
+    """PINS DECISION 1. A hypothesis that cannot be turned into code is the
+    realizer failing its side of the port, not evidence about the slot."""
+    controller, journal = _controller(
+        realizer=ScriptedRealizer([]),  # exhausted on the first call
+        policy=_StickyPolicy("model"),
+        max_nodes_per_stage=8,
+        failures_before_block=2,
+    )
+
+    ended, _ = controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL),
+        Stage.STAGE_1_STRUCTURAL,
+    )
+
+    assert _blocks(journal) == []
+    assert ended.blocked_slots == frozenset()
+    assert slot_stats(ended)["model"].attempts == 8
+    assert slot_stats(ended)["model"].consecutive_failures == 0
+
+
+def test_clean_gate_rejections_never_block():
+    """PINS DECISION 1. A rejection is a working arm reporting no
+    improvement — the negative result the search exists to collect, and
+    exactly the signal the bandit consumes. Blocking on it would stop the
+    search the moment it learned something."""
+    controller, journal = _controller(
+        gate=AlwaysRejectGate(),
+        policy=_StickyPolicy("model"),
+        max_nodes_per_stage=8,
+        failures_before_block=2,
+    )
+
+    ended, _ = controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL),
+        Stage.STAGE_1_STRUCTURAL,
+    )
+
+    assert _blocks(journal) == []
+    assert ended.blocked_slots == frozenset()
+    stats = slot_stats(ended)
+    assert stats["model"].attempts == 8
+    # One acceptance, and it is not the gate's doing: the first candidate of
+    # a stage entered with no incumbent is adopted without the gate being
+    # called at all. The other seven went to AlwaysRejectGate and were
+    # rejected — seven rulings, seven deltas, and not one of them a failure.
+    assert stats["model"].accepted == 1
+    assert len(stats["model"].deltas) == 7
+    assert not any(e.executor_failed for e in ended.history)
+
+
+def test_only_the_executor_failure_path_marks_the_history_entry():
+    """The flag the breaker counts is set on exactly one path. Asserted on
+    a run that produces an acceptance, a rejection and a failure, so a
+    future edit that set it too eagerly is caught here."""
+    controller, _ = _controller(
+        executor=_ClimbingExecutor(fail_on=_fails_on_slot("model", times=1)),
+        gate=_AlternatingGate(),
+        policy=_StickyPolicy("model"),
+        max_nodes_per_stage=4,
+    )
+
+    ended, _ = controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL),
+        Stage.STAGE_1_STRUCTURAL,
+    )
+
+    flagged = [e for e in ended.history if e.executor_failed]
+    assert len(flagged) == 1
+    assert flagged[0].primary is None
+    assert flagged[0].accepted is False
+    assert flagged[0].tokens > 0  # a failure that cost real evaluation time
+    assert any(e.accepted for e in ended.history)  # and the run did commit
+
+
+def test_the_baseline_failing_blocks_nothing_because_no_policy_chose_it():
+    """REPRODUCE_BASELINE evaluates a fixed published config. A baseline
+    that will not run is a broken harness, not a bad arm, and there is no
+    slot to hold responsible."""
+    def hook(config):
+        return (ErrorClass.DEPENDENCY, "synthetic baseline failure")
+
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(fail_on=hook), failures_before_block=1
+    )
+
+    ended, _ = controller._run_stage(
+        RunState(run_id="run-test", stage=Stage.REPRODUCE_BASELINE),
+        Stage.REPRODUCE_BASELINE,
+    )
+
+    assert _blocks(journal) == []
+    assert ended.blocked_slots == frozenset()
+    assert ended.history[0].target_slot is None
+    assert ended.history[0].executor_failed is True  # still recorded honestly
+
+
+# -- DECISION 2: blocking is stage-scoped -------------------------------
+
+
+def test_with_stage_clears_blocked_slots():
+    """PINS DECISION 2 at the state level. Blocking is a budget decision
+    scoped to one stage, and `with_blocked_slot` only ever adds — without
+    this there is no unblock path anywhere and a transient OOM would delete
+    an arm for the rest of the run."""
+    state = RunState(
+        run_id="r",
+        stage=Stage.STAGE_1_STRUCTURAL,
+        blocked_slots=frozenset({"model", "features"}),
+    )
+
+    moved = state.with_stage(Stage.STAGE_2_COMBINE)
+
+    assert moved.blocked_slots == frozenset()
+    assert state.blocked_slots == frozenset({"model", "features"})  # still pure
+
+
+def test_clearing_the_blocks_keeps_the_history_that_justified_them():
+    """The block goes; the evidence does not. A slot that failed twice
+    comes back eligible but with a poor record, which is the right amount
+    of memory for the bandit to carry across a stage boundary."""
+    state = RunState(run_id="r", stage=Stage.STAGE_1_STRUCTURAL)
+    state = state.with_outcome(
+        "a", None, False, target_slot="model", tokens=1200, executor_failed=True
+    )
+    state = state.with_blocked_slot("model")
+
+    moved = state.with_stage(Stage.STAGE_2_COMBINE)
+
+    assert moved.blocked_slots == frozenset()
+    assert slot_stats(moved)["model"].consecutive_failures == 1
+    assert slot_stats(moved)["model"].attempts == 1
+
+
+def test_a_slot_blocked_in_one_stage_is_offered_again_in_the_next():
+    """PINS DECISION 2 end to end, through the real stage machinery.
+
+    AND THE NON-OBVIOUS HALF OF IT, pinned because it surprised us. The
+    BLOCK clears at the stage boundary; the EVIDENCE does not.
+    `consecutive_failures` is folded over the whole history, so a slot that
+    failed twice in stage one returns in stage two already at two, and one
+    more failure re-blocks it immediately rather than buying it a fresh
+    allowance of k.
+
+    That is the intended reading of the two decisions together, not a gap
+    between them. Stage entry does not make a failure un-happen, and a
+    genuinely dead arm should not cost k evaluations in every stage. What
+    the slot gets back is a real chance: one pull, and if it SUCCEEDS the
+    counter resets to zero and its full allowance returns with it. So the
+    arm below is offered twice in stage one - the two pulls that earned the
+    block - and once in each stage after.
+    """
+    policy = _StickyPolicy("model")
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(fail_on=_fails_on_slot("model")),
+        generator=ScriptedGenerator(_script(40)),
+        policy=policy,
+        max_nodes_per_stage=4,
+        failures_before_block=2,
+    )
+
+    final = controller.run()
+
+    # Blocked once per search stage: cleared on entry, earned again.
+    blocked = _blocks(journal)
+    assert len(blocked) == SEARCH_STAGES
+    assert {e.payload["slot"] for e in blocked} == {"model"}
+    assert [e.payload["stage"] for e in blocked] == [
+        Stage.STAGE_1_STRUCTURAL.value,
+        Stage.STAGE_2_COMBINE.value,
+        Stage.STAGE_3_TUNE.value,
+    ]
+    # Two pulls in stage one to earn the block, then one in each later
+    # stage: offered again, but on a record that followed it across.
+    assert sum(1 for offer in policy.offered if "model" in offer) == 2 + 1 + 1
+    # The point of DECISION 2 all the same — every stage began with the arm
+    # available rather than deleted for the rest of the run.
+    assert "model" in policy.offered[0]
+    assert "model" in policy.offered[4]  # first attempt of stage two
+    assert final.stage is Stage.DONE
+    assert final.blocked_slots == frozenset()  # cleared on the way to FINALIZE
+
+
+# -- a stage whose arms all go down -------------------------------------
+
+
+def test_a_stage_whose_arms_all_get_blocked_ends_cleanly_and_the_run_finishes():
+    """The fully-blocked path, reached from a real run rather than a
+    hand-built state: every arm fails twice, the candidate set empties, and
+    the stage ends through the existing check instead of crashing or asking
+    a policy to choose from nothing."""
+    policy = _StickyPolicy("model")
+    controller, journal = _controller(
+        executor=_ClimbingExecutor(fail_on=_fails_on_any_search_candidate()),
+        generator=ScriptedGenerator(_script(80)),
+        policy=policy,
+        max_nodes_per_stage=12,
+        failures_before_block=2,
+    )
+
+    final = controller.run()
+
+    # THE POINT: the policy was never handed an empty set.
+    assert policy.offered  # it was called at all
+    assert all(offer for offer in policy.offered)
+    # Four structural arms, two failures each, then the stage ends.
+    assert len(_blocks(journal)) == 4 + 4 + 6  # stages 1, 2 and 3's arms
+    stage_ends = [
+        e
+        for e in journal.events_of_kind(EventKind.SLOT_BLOCKED)
+        if e.payload["action"] == "end_stage"
+    ]
+    assert len(stage_ends) == SEARCH_STAGES
+    # And the run still terminates through the ordinary path.
+    assert final.stage is Stage.DONE
+    assert _kinds(journal)[-1] == EventKind.RUN_END.value
+
+
+def test_a_fully_blocked_stage_consumes_no_node_and_writes_no_history():
+    controller, _ = _controller(
+        executor=_ClimbingExecutor(fail_on=_fails_on_any_search_candidate()),
+        generator=ScriptedGenerator(_script(40)),
+        policy=_StickyPolicy("model"),
+        max_nodes_per_stage=12,
+        failures_before_block=2,
+    )
+    state = RunState(run_id="run-test", stage=Stage.STAGE_1_STRUCTURAL)
+
+    ended, _ = controller._run_stage(state, Stage.STAGE_1_STRUCTURAL)
+
+    # Eight attempts (four arms, two failures each), then the stage ends —
+    # the remaining four nodes of the budget are simply not spent.
+    assert ended.node == 8
+    assert len(ended.history) == 8
+    assert ended.blocked_slots == frozenset(STAGE_SLOTS[Stage.STAGE_1_STRUCTURAL])
+
+
+# -- the card carries what the bandit reads -----------------------------
+
+
+def test_the_state_card_carries_slot_stats_for_the_policy_and_survives_json():
+    """FLAGGED ADDITION: `slot_stats` is a new top-level card key, and the
+    card is W4's interface. An addition, not a rename."""
+    controller, _ = _controller(policy=FixedOrderPolicy(STRUCTURAL_ORDER))
+    state = controller.run()
+
+    card = build_state_card(state)
+
+    assert set(card["slot_stats"]) == set(STRUCTURAL_ORDER)
+    assert card["slot_stats"]["features"]["attempts"] == 3
+    assert card["slot_stats"] == slot_stats_as_json(slot_stats(state))
+    assert json.loads(json.dumps(card, allow_nan=False)) == card
+
+
+def test_the_policy_and_the_generator_see_the_same_slot_stats():
+    """One card, built once, handed to both — so "what did the run look
+    like when the slot was picked" and "what did the generator know" cannot
+    become two questions with two answers."""
+    class _RecordingPolicy:
+        def __init__(self) -> None:
+            self.cards: list[dict] = []
+
+        def select_slot(self, state_card, candidate_slots):
+            self.cards.append(dict(state_card))
+            return candidate_slots[0]
+
+    policy = _RecordingPolicy()
+    generator = ScriptedGenerator(_script())
+    controller, _ = _controller(policy=policy, generator=generator)
+
+    controller.run()
+
+    assert len(policy.cards) == len(generator.state_cards)
+    for seen_by_policy, seen_by_generator in zip(
+        policy.cards, generator.state_cards
+    ):
+        assert seen_by_policy["slot_stats"] == seen_by_generator["slot_stats"]
+
+
+def test_the_card_shows_the_bandit_a_growing_record_of_the_arm_it_pulled():
+    """The feedback loop, end to end: what the policy did last time is on
+    the card it reads next time."""
+    generator = ScriptedGenerator(_script())
+    controller, _ = _controller(
+        policy=FixedOrderPolicy(("model",)), generator=generator
+    )
+
+    controller.run()
+
+    attempts = [
+        (card["slot_stats"].get("model") or {}).get("attempts", 0)
+        for card in generator.state_cards
+    ]
+    assert attempts == list(range(len(attempts)))  # 0, 1, 2, ... one per pull

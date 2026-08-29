@@ -35,6 +35,7 @@ there is nothing left rather than a self-inflicted early stop.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, NamedTuple, Optional
@@ -61,6 +62,7 @@ __all__ = [
     "build_state_card",
     "next_stage",
     "slot_stats",
+    "slot_stats_as_json",
 ]
 
 
@@ -286,6 +288,46 @@ class HistoryEntry(NamedTuple):
     payload logs, so the per-slot totals and the run total are commensurable.
     """
 
+    executor_failed: bool = False
+    """True only for an attempt the EXECUTOR ran and reported FAILED.
+
+    THE CIRCUIT BREAKER'S ONLY INPUT, and the reason it is a stored field
+    rather than something derived at read time.
+
+    Four distinct outcomes arrive here as `accepted=False`, and they are
+    not the same event:
+
+      (a) the generator proposed a slot other than the one it was asked
+          for                                    -> MISPROPOSED_CONFIG_ID
+      (b) the realizer could not turn a hypothesis into code
+                                                 -> UNREALIZED_CONFIG_ID
+      (c) the executor ran the candidate and it failed  -> THIS FLAG
+      (d) the gate ruled against it               -> a clean rejection
+
+    Only (c) is evidence that spending more evaluations on this slot is
+    wasteful. (a) and (b) are contract breaches by another workstream's
+    collaborator - blocking `weighting` because W4's generator kept naming
+    the wrong slot would delete a good arm over somebody else's bug - and
+    (d) is a working arm honestly reporting no improvement, which is the
+    signal the bandit exists to consume rather than a reason to stop.
+
+    WHY A FIELD RATHER THAN A config_id COMPARISON. The alternative was to
+    recognise (a) and (b) by testing `config_id` against
+    MISPROPOSED_CONFIG_ID and UNREALIZED_CONFIG_ID. Two problems. First,
+    those constants live in controller/controller.py, which imports THIS
+    module - reading them here would close an import cycle, so state.py
+    would have to carry its own copy of the two string literals and the
+    circuit breaker would silently start blocking on contract breaches the
+    day either constant was edited on one side only. Second, a sentinel
+    comparison infers the outcome from a stand-in value chosen for a
+    different purpose (giving `config_id` something printable), whereas the
+    Controller knows the answer outright at the point it writes the entry.
+
+    A bool rather than an enum because the question the breaker asks is
+    exactly binary. Defaulting to False keeps every existing call site
+    correct without change: only the executor-failure path passes True.
+    """
+
 
 STATE_CARD_HISTORY = 5
 """How many recent attempts the state card carries.
@@ -334,8 +376,32 @@ class RunState:
     # -- pure derivations ---------------------------------------------
 
     def with_stage(self, stage: Stage) -> RunState:
-        """Move to `stage`. Callers must source it from `next_stage`."""
-        return replace(self, stage=stage)
+        """Move to `stage`. Callers must source it from `next_stage`.
+
+        BLOCKED SLOTS ARE CLEARED HERE. Blocking is stage-scoped, and this
+        is the transition that scopes it.
+
+        The circuit breaker blocks a slot so the agent stops re-debugging
+        one bad idea for the rest of the stage it went wrong in. That is a
+        budget argument, not a verdict about the slot: the evidence for
+        blocking is k consecutive executor failures, and an executor
+        failure can just as easily be an OOM on a busy machine, a transient
+        library fault or one badly-realized candidate as it can be a slot
+        that is genuinely a dead end. Carrying a block forward for the rest
+        of the run would let a transient fault permanently delete an arm -
+        with no unblock path anywhere, since `with_blocked_slot` only ever
+        adds - and the later stages are exactly where a slot deserves
+        another look: STAGE_3_TUNE attacks a different question with the
+        same arms, on top of an incumbent that has since moved.
+
+        So a block costs the slot the remainder of one stage and no more.
+        The full history survives regardless, so `slot_stats` still shows
+        the failures and the bandit still scores the arm accordingly - a
+        slot that failed three times in stage one comes back into stage two
+        eligible but with a poor record, which is the right amount of
+        memory to carry.
+        """
+        return replace(self, stage=stage, blocked_slots=frozenset())
 
     def with_node_started(self) -> RunState:
         """Increment `node` at the *start* of an attempt.
@@ -366,6 +432,7 @@ class RunState:
         wall_seconds: float = 0.0,
         gpu_seconds: float = 0.0,
         tokens: int = 0,
+        executor_failed: bool = False,
     ) -> RunState:
         """Record an attempt's result: history always, `iteration` only on
         acceptance.
@@ -381,6 +448,11 @@ class RunState:
         those numbers must pass them for every outcome, acceptance and
         failure alike - see HistoryEntry's field docs for why a zero on a
         failed attempt would actively mislead the search policy.
+
+        `executor_failed` defaults to False so only the one path that means
+        it - the executor ran this candidate and reported FAILED - has to
+        say so. See HistoryEntry.executor_failed for why the other three
+        non-accepted outcomes must not set it.
 
         Still pure: derives a new RunState and touches nothing on this one.
         """
@@ -400,6 +472,7 @@ class RunState:
                     wall_seconds=wall_seconds,
                     gpu_seconds=gpu_seconds,
                     tokens=tokens,
+                    executor_failed=executor_failed,
                 ),
             ),
         )
@@ -491,6 +564,26 @@ class SlotStats:
     claim than "never measured".
     """
 
+    consecutive_failures: int = 0
+    """Executor failures at the TAIL of this slot's attempts. The circuit
+    breaker's counter.
+
+    Counts only `HistoryEntry.executor_failed` entries - see that field for
+    why a generator slot-mismatch, a realizer exhaustion and a clean gate
+    rejection all leave this alone. Any other outcome on this slot resets
+    it to zero, so it measures a current run of failures rather than a
+    lifetime total: a slot that failed twice, was fixed, and has since
+    worked is not one attempt away from being blocked.
+
+    WHY IT IS FOLDED HERE RATHER THAN DERIVED FROM THE OTHER FIELDS. It
+    cannot be. Every other field on this class is order-free - a count or a
+    sum - and could be recomputed from an unordered bag of entries.
+    "Consecutive" is a statement about the ORDER of the attempts, and
+    `slot_stats` is the only place that still sees it: by the time the fold
+    returns, the sequence is gone. Deriving it afterwards from `attempts`
+    and `accepted` is not merely awkward, it is impossible.
+    """
+
 
 def slot_stats(state: RunState) -> dict[SlotName, SlotStats]:
     """Per-slot aggregation over `state.history`. Pure; a fold, not a cache.
@@ -533,8 +626,46 @@ def slot_stats(state: RunState) -> dict[SlotName, SlotStats]:
                 if entry.delta is None
                 else current.deltas + (entry.delta,)
             ),
+            # Folded in the pass, because this is the only place the
+            # ORDER of the attempts is still visible. Incremented on an
+            # executor failure, reset to zero by literally anything else
+            # on this slot.
+            consecutive_failures=(
+                current.consecutive_failures + 1 if entry.executor_failed else 0
+            ),
         )
     return stats
+
+
+def slot_stats_as_json(stats: Mapping[SlotName, SlotStats]) -> dict[str, Any]:
+    """`slot_stats` output in the shape it will have after a JSON hop.
+
+    The same job `_history_as_json` does for one HistoryEntry, and for the
+    same reason: `deltas` is a tuple on the way in and a list on the way
+    out, since json has only one sequence type. Rendering here means what
+    the Controller hands the policy in-process is byte-identical to what a
+    collaborator on the far side of a serialisation boundary receives, and
+    keeps `json.loads(json.dumps(card)) == card` true.
+
+    Public rather than underscored because it is the one place that fixes
+    the wire shape a policy reads. A policy hand-rolling its own dict of
+    per-slot numbers in a test would be asserting against a shape nothing
+    guarantees.
+
+    Slots come out sorted by name so two runs with the same history
+    produce the same key order in the journal and in any diff of it.
+    """
+    return {
+        slot: {
+            "attempts": entry.attempts,
+            "accepted": entry.accepted,
+            "total_tokens": entry.total_tokens,
+            "total_wall_seconds": entry.total_wall_seconds,
+            "deltas": list(entry.deltas),
+            "consecutive_failures": entry.consecutive_failures,
+        }
+        for slot, entry in sorted(stats.items())
+    }
 
 
 def build_state_card(state: RunState) -> dict[str, Any]:
@@ -574,8 +705,44 @@ def build_state_card(state: RunState) -> dict[str, Any]:
     back. Putting a second copy in the card would create a channel through
     which the constraint could be honoured or not with no way to tell.
 
-    So the card's TOP-LEVEL KEY SET IS UNCHANGED by this PR. W4 codes
-    against the same ten keys as before.
+    *** FLAGGED: ONE NEW TOP-LEVEL KEY, `slot_stats`. W4 READS THIS. ***
+    ------------------------------------------------------------------
+    The card now carries `slot_stats` - the whole of `slot_stats(state)`,
+    rendered JSON-safe. It is an ADDITION, not a rename: all ten previous
+    keys are present with identical meaning, so nothing coded against the
+    old shape breaks. Announced loudly anyway, because this file's contract
+    is "additions are cheap, renames are a cross-team change" and the
+    cheapness of an addition is not a licence to make one quietly.
+
+    WHY IT GOES ON THE CARD, WHEN THE PREFERENCE IS TO LEAVE THE CARD
+    ALONE. CostAwareBanditPolicy scores arms on realized improvement per
+    token, so it needs per-slot history. The card is the only channel
+    PolicyPort has: `select_slot(state_card, candidate_slots)`, and the
+    other two options are both worse.
+
+      - Widening PolicyPort to take a RunState would hand every policy the
+        entire mutable-by-derivation world and make the port a
+        controller-internal type, which is the seam we deliberately kept
+        narrow so a policy stays testable as a pure function.
+      - A side channel - an `observe(stats)` hook the Controller calls
+        before `select_slot` - would create a SECOND account of what the
+        run looks like, alongside the card. Controller._attempt goes out of
+        its way to build one card and hand it to both the policy and the
+        generator precisely so that "what did the run look like when the
+        slot was picked" and "what did the generator know" cannot become
+        two questions with two answers. A second channel reintroduces
+        exactly that, and it would be the channel carrying the numbers the
+        search decision actually turned on.
+
+    So one card, one derivation, both readers. It is also genuinely useful
+    to a generator, which can now see which arms have been paying off
+    rather than re-deriving that from five truncated history entries.
+
+    Note the asymmetry with the selected slot below: that is excluded
+    because it does not EXIST when the card is built. Per-slot history does
+    exist, and is the same for both readers.
+
+    THE SELECTED SLOT IS STILL NOT A KEY HERE.
 
     ONE NESTED CHANGE, FLAGGED BECAUSE W4 READS IT: each entry in
     `recent_history` now carries four additional keys - `target_slot`
@@ -596,7 +763,11 @@ def build_state_card(state: RunState) -> dict[str, Any]:
         incumbent_primary   float | None
         recent_history      list of {config_id, primary, accepted, delta,
                              ci95, significant, target_slot, wall_seconds,
-                             gpu_seconds, tokens}
+                             gpu_seconds, tokens, executor_failed}
+        slot_stats          {slot name: {attempts, accepted, total_tokens,
+                             total_wall_seconds, deltas, consecutive_failures}}
+                             — attempted slots only; an absent slot means
+                             "no data", never "zero"
         blocked_slots       sorted list of slot names
         budget_remaining    {counter name: float | None}
         convergence         {iterations_considered, epsilon, n_required,
@@ -625,6 +796,12 @@ def build_state_card(state: RunState) -> dict[str, Any]:
         "recent_history": [
             _history_as_json(entry) for entry in state.history[-STATE_CARD_HISTORY:]
         ],
+        # NOT truncated, unlike recent_history. This is an aggregate over
+        # six slots at most, so it is bounded by the slot vocabulary rather
+        # than by the run length, and truncating it would defeat the point:
+        # a bandit scoring an arm on a five-attempt window would forget
+        # everything it learned in the stage before.
+        "slot_stats": slot_stats_as_json(slot_stats(state)),
         "blocked_slots": sorted(state.blocked_slots),
         "budget_remaining": {
             name: _remaining_or_none(getattr(state.budget, name))

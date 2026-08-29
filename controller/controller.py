@@ -78,6 +78,7 @@ from controller.state import (
     Stage,
     build_state_card,
     next_stage,
+    slot_stats,
 )
 
 __all__ = [
@@ -160,6 +161,7 @@ class Controller:
         budget: Optional[Budget] = None,
         seeds: Sequence[int] = (0,),
         max_nodes_per_stage: int = 3,
+        failures_before_block: int = 2,
         run_id: Optional[str] = None,
     ) -> None:
         self._executor = executor
@@ -193,6 +195,24 @@ class Controller:
         # an unlimited default Budget and an accepting gate — still
         # terminates. It is the only hard termination guarantee left.
         self._max_nodes_per_stage = max_nodes_per_stage
+        if failures_before_block < 1:
+            # Zero or less would block a slot before it had failed at all,
+            # emptying the candidate set on the first attempt of a stage
+            # and ending every stage without evaluating anything. A raise
+            # rather than a clamp: silently correcting it would hide a
+            # wiring mistake behind a run that looked merely unlucky.
+            raise ValueError(
+                "failures_before_block must be at least 1, got "
+                f"{failures_before_block}"
+            )
+        # A TUNABLE, NOT A LAW. Two consecutive executor failures on one
+        # slot is a defensible default and nothing more: it stops the agent
+        # re-debugging one bad idea for a whole stage, while still giving
+        # a slot a second chance, since a single failure is as likely to be
+        # a flaky machine as a dead end. Nobody has measured the right
+        # number - it is exposed here so a run can change it without
+        # editing this file, and so the journal can record what was used.
+        self._failures_before_block = failures_before_block
         # Callers who want a byte-reproducible journal should pass run_id;
         # the generated default is deliberately unique per run so two runs
         # cannot be confused for one another in a shared log.
@@ -521,20 +541,25 @@ class Controller:
                     "error_excerpt": result.error_excerpt,
                 },
             )
-            return (
-                state.with_outcome(
-                    result.config_id,
-                    None,
-                    accepted=False,
-                    target_slot=target_slot,
-                    # NON-ZERO, and that is the whole point. A candidate
-                    # that died halfway still burned what it took to get
-                    # there; recording zero would make the slot that
-                    # produced it look cheap. See HistoryEntry's cost docs.
-                    **_attempt_cost(result),
-                ),
+            state = state.with_outcome(
+                result.config_id,
                 None,
+                accepted=False,
+                target_slot=target_slot,
+                # NON-ZERO, and that is the whole point. A candidate
+                # that died halfway still burned what it took to get
+                # there; recording zero would make the slot that
+                # produced it look cheap. See HistoryEntry's cost docs.
+                **_attempt_cost(result),
+                # THE ONLY PLACE THIS IS SET. The circuit breaker counts
+                # executor failures and nothing else - see
+                # HistoryEntry.executor_failed for why the generator
+                # mismatch and realizer exhaustion paths above must not.
+                executor_failed=True,
             )
+            # Recorded first, then judged: the entry just written is part
+            # of the run this decision is about, so blocking has to see it.
+            return self._maybe_block_slot(state, stage, target_slot), None
 
         if state.incumbent is None:
             # Nothing to compare against yet, so the gate is not called —
@@ -598,6 +623,68 @@ class Controller:
             # changes nothing convergence looks at.
             return state, None
         return self._check_convergence(state)
+
+    def _maybe_block_slot(
+        self, state: RunState, stage: Stage, target_slot: Optional[SlotName]
+    ) -> RunState:
+        """Block `target_slot` for this stage once its failures reach k.
+
+        THE CIRCUIT BREAKER. The agent's job is to spend a fixed budget of
+        evaluations well, and re-attacking a slot whose last k candidates
+        all died in the executor spends it on re-debugging one bad idea.
+        After k, the slot leaves the candidate set and the search moves on.
+
+        WHAT COUNTS, AND WHAT POINTEDLY DOES NOT. Only executor failures,
+        counted consecutively per slot by `SlotStats.consecutive_failures`.
+        A generator that proposed the wrong slot and a realizer that could
+        not produce code are contract breaches by other workstreams'
+        collaborators, and a clean gate rejection is a working arm honestly
+        reporting no improvement. Blocking on any of those would delete
+        good arms over somebody else's bug, or over exactly the negative
+        result the search exists to collect. See
+        HistoryEntry.executor_failed.
+
+        STAGE-SCOPED. `RunState.with_stage` clears blocked_slots on entry
+        to the next stage, so a block costs a slot the remainder of one
+        stage and never the run - a transient OOM must not permanently
+        delete an arm. The failures stay in history either way, so the
+        bandit still scores the arm on its record when it returns.
+
+        Returns the state unchanged when there is nothing to block, so the
+        caller can use it unconditionally. `target_slot` is None for the
+        REPRODUCE_BASELINE evaluation: that runs a fixed published config
+        no policy chose, and a baseline that will not run is a broken
+        harness rather than a bad arm - there is no slot to hold
+        responsible and blocking one would be a guess.
+        """
+        if target_slot is None:
+            return state
+        stats = slot_stats(state).get(target_slot)
+        if stats is None or stats.consecutive_failures < self._failures_before_block:
+            return state
+
+        state = state.with_blocked_slot(target_slot)
+        # Emitted AFTER the ERROR event for the failure that tripped it,
+        # and after the state already carries the block, so a reader sees
+        # the cause, then the consequence, then a `blocked_slots` that
+        # agrees with the run from this point on.
+        self._emit(
+            state,
+            EventKind.SLOT_BLOCKED,
+            {
+                "slot": target_slot,
+                "consecutive_failures": stats.consecutive_failures,
+                "threshold": self._failures_before_block,
+                "stage": stage.value,
+                "blocked_slots": sorted(state.blocked_slots),
+                "reason": "consecutive executor failures reached the threshold",
+                # Distinguishes this from the other SLOT_BLOCKED emission,
+                # which reports a stage ending because everything was
+                # already blocked rather than a slot being blocked now.
+                "action": "block_slot",
+            },
+        )
+        return state
 
     def _check_convergence(self, state: RunState) -> tuple[RunState, Optional[str]]:
         """Assess both stopping rules after a commit and log the result.

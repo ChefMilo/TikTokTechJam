@@ -42,6 +42,7 @@ from controller.fakes import (
     InMemoryJournal,
     ScriptedGenerator,
     ScriptExhaustedError,
+    SlotSensitiveExecutor,
     mean_primary,
     metrics_from_delta,
 )
@@ -820,3 +821,144 @@ def test_disobedient_generator_inherits_the_scripted_exhaustion_behaviour() -> N
 def test_both_generators_still_satisfy_the_resignatured_port() -> None:
     assert isinstance(ScriptedGenerator([]), GeneratorPort)
     assert isinstance(DisobedientGenerator([]), GeneratorPort)
+
+
+# ---------------------------------------------------------------------------
+# SlotSensitiveExecutor — the ground truth a search policy is measured on
+# ---------------------------------------------------------------------------
+
+
+def _baseline_config() -> PipelineConfig:
+    """A fully-occupied config. Every slot must be filled or `config_id`
+    raises KeyError while walking SLOT_ORDER."""
+    return PipelineConfig(slots={slot: SlotConfig(impl="base") for slot in SLOT_ORDER})
+
+
+def _with_slot(base: PipelineConfig, slot: str, impl: str) -> PipelineConfig:
+    slots = dict(base.slots)
+    slots[slot] = SlotConfig(impl=impl)
+    return PipelineConfig(slots=slots)
+
+
+def test_slot_sensitive_executor_satisfies_the_port() -> None:
+    assert isinstance(SlotSensitiveExecutor("model"), ExecutorPort)
+
+
+def test_it_rejects_a_favoured_slot_that_is_not_a_slot() -> None:
+    """A typo would produce a fake with no favoured arm at all, and the
+    ablation built on it would compare two policies in a world where
+    neither can do better — then pass or fail on noise."""
+    with pytest.raises(ValueError, match="favoured_slot"):
+        SlotSensitiveExecutor("modle")
+
+
+def test_the_favoured_slot_earns_the_effect_and_others_get_only_noise() -> None:
+    """The ground truth in one assertion: changing the named slot is worth
+    `effect`; changing anything else is worth nothing."""
+    base = _baseline_config()
+    executor = SlotSensitiveExecutor(
+        "weighting", effect=0.02, seed=0, reference=base
+    )
+    seeds = (0, 1, 2, 3, 4)
+
+    favoured = mean_primary(executor.run(_with_slot(base, "weighting", "x"), seeds).val)
+    other = mean_primary(executor.run(_with_slot(base, "model", "y"), seeds).val)
+
+    # Intervals, never exact floats — sigma is 0.0008 and there are five
+    # seeds, so a few thousandths of slack is generous either way.
+    assert favoured == pytest.approx(BASELINE_PRIMARY + 0.02, abs=0.003)
+    assert other == pytest.approx(BASELINE_PRIMARY, abs=0.003)
+    assert favoured - other > 0.015
+
+
+def test_the_reference_config_itself_gets_no_effect() -> None:
+    """The baseline must score the baseline. Otherwise the run's very first
+    number — the one checked against a published figure — is inflated by
+    this double."""
+    base = _baseline_config()
+    executor = SlotSensitiveExecutor("weighting", effect=0.02, reference=base)
+
+    scored = mean_primary(executor.run(base, (0, 1, 2, 3, 4)).val)
+
+    assert scored == pytest.approx(BASELINE_PRIMARY, abs=0.003)
+
+
+def test_the_first_config_is_latched_as_the_reference_when_none_is_given() -> None:
+    """In a real run that first call is REPRODUCE_BASELINE, so the default
+    reads as "better than the published baseline"."""
+    base = _baseline_config()
+    executor = SlotSensitiveExecutor("weighting", effect=0.02)
+    assert executor.reference is None
+
+    first = mean_primary(executor.run(base, (0, 1, 2)).val)
+
+    assert executor.reference is base
+    assert first == pytest.approx(BASELINE_PRIMARY, abs=0.003)
+    later = mean_primary(executor.run(_with_slot(base, "weighting", "x"), (0, 1, 2)).val)
+    assert later == pytest.approx(BASELINE_PRIMARY + 0.02, abs=0.003)
+
+
+def test_a_params_only_change_to_the_favoured_slot_still_counts() -> None:
+    """SlotConfig is the unit of identity here and params are part of it."""
+    base = _baseline_config()
+    executor = SlotSensitiveExecutor("model", effect=0.02, reference=base)
+    slots = dict(base.slots)
+    slots["model"] = SlotConfig(impl="base", params={"k": 32})
+
+    scored = mean_primary(executor.run(PipelineConfig(slots=slots), (0, 1, 2)).val)
+
+    assert scored == pytest.approx(BASELINE_PRIMARY + 0.02, abs=0.003)
+
+
+def test_it_is_reproducible_from_its_seed() -> None:
+    base = _baseline_config()
+    candidate = _with_slot(base, "weighting", "x")
+
+    def sequence(seed: int) -> list[float]:
+        executor = SlotSensitiveExecutor(
+            "weighting", effect=0.02, seed=seed, reference=base
+        )
+        return [mean_primary(executor.run(candidate, (0, 1)).val) for _ in range(5)]
+
+    assert sequence(3) == sequence(3)
+    assert sequence(3) != sequence(4)
+
+
+def test_it_draws_val_and_backtest_independently() -> None:
+    """A candidate can win on one split and lose on the other — a fake that
+    returned identical numbers would make that untestable."""
+    base = _baseline_config()
+    executor = SlotSensitiveExecutor("weighting", seed=1, reference=base)
+
+    result = executor.run(base, (0, 1, 2, 3, 4))
+
+    assert result.val != result.backtest
+    assert set(result.val) == set(result.backtest) == {0, 1, 2, 3, 4}
+
+
+def test_it_populates_cost_fields_on_success_and_on_failure() -> None:
+    """A candidate that died halfway still burned what it took to get
+    there; a fake recording zero would make a fragile slot look cheap."""
+    base = _baseline_config()
+    ok = SlotSensitiveExecutor("weighting", reference=base).run(base, (0, 1))
+    failed = SlotSensitiveExecutor(
+        "weighting",
+        reference=base,
+        fail_on=lambda config: (ErrorClass.OOM, "synthetic"),
+    ).run(base, (0, 1))
+
+    assert ok.status is Status.OK
+    assert ok.wall_seconds > 0 and ok.tokens_in > 0 and ok.tokens_out > 0
+    assert failed.status is Status.FAILED
+    assert failed.error_class is ErrorClass.OOM
+    assert failed.wall_seconds > 0 and failed.tokens_in > 0
+    assert failed.val == {} and failed.backtest == {}
+
+
+def test_it_records_what_it_was_asked_for() -> None:
+    base = _baseline_config()
+    executor = SlotSensitiveExecutor("weighting", reference=base)
+
+    executor.run(base, (0, 2, 4))
+
+    assert executor.calls == [(base.config_id, (0, 2, 4))]

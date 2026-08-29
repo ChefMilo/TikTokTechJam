@@ -60,6 +60,7 @@ __all__ = [
     "ScriptedGateExhausted",
     "ScriptedGenerator",
     "ScriptedRealizer",
+    "SlotSensitiveExecutor",
     "mean_primary",
     "metrics_from_delta",
 ]
@@ -264,6 +265,143 @@ class FakeExecutor:
     def _draw(self) -> float:
         """One shift off the baseline: the true effect plus fresh noise."""
         return self.true_effect + self._rng.normalvariate(0.0, self.sigma)
+
+
+class SlotSensitiveExecutor:
+    """One slot genuinely helps; every other difference is noise.
+
+    THE GROUND TRUTH A SEARCH POLICY CAN BE MEASURED AGAINST
+    -------------------------------------------------------
+    FakeExecutor's draw does not depend on the config at all, which makes
+    it the right instrument for acceptance logic - every acceptance is a
+    known false positive - and the wrong one for search. Against a fake
+    where nothing is better than anything else, EVERY policy is optimal and
+    a bandit cannot be distinguished from a coin.
+
+    This fake supplies the missing half: a world in which one arm really is
+    better. `favoured_slot` filled with anything other than the reference
+    config's entry scores `effect` above baseline; every other candidate
+    scores baseline plus noise. So "did the policy find the good arm" is a
+    question with a right answer, and the difference between the bandit and
+    its uniform control is measurable rather than asserted.
+
+    THE REFERENCE CONFIG
+    --------------------
+    Effect is decided by comparing the candidate's `favoured_slot` against
+    a reference. Pass one explicitly when a test wants to be exact.
+    Otherwise the FIRST config handed to `run` is latched as the reference,
+    which in a real Controller run is the REPRODUCE_BASELINE evaluation -
+    so the default reads as "better than the published baseline", which is
+    the comparison the whole project is about. The latch is recorded on
+    `reference` so a test can assert on which config it caught.
+
+    WHY THE WHOLE SlotConfig AND NOT JUST `impl`: SlotConfig is the unit of
+    identity here and params are part of it, so a hyperparameter-only
+    change to the favoured slot counts as a change. A test that wants the
+    narrower reading can pass a reference whose favoured slot it controls.
+
+    NO EFFECT IS APPLIED TO THE REFERENCE ITSELF, including when it is the
+    latched first call. The baseline must score the baseline, or the run's
+    very first number - the one checked against a published figure - would
+    be inflated by this double.
+
+    Same discipline as the other doubles: per-instance `random.Random`, no
+    I/O, no clock, per-seed val AND backtest drawn independently, cost
+    fields populated on success and on failure alike. `calls` records what
+    was asked for, exactly as FakeExecutor does, and the same sharp edge
+    applies - the stream advances per call, so build a fresh instance per
+    test rather than sharing one.
+    """
+
+    def __init__(
+        self,
+        favoured_slot: SlotName,
+        effect: float = 0.02,
+        seed: int = 0,
+        sigma: float = BASELINE_SIGMA,
+        reference: Optional[PipelineConfig] = None,
+        fail_on: Optional[FailureHook] = None,
+    ) -> None:
+        if favoured_slot not in SLOT_ORDER:
+            # A typo here would produce a fake with no favoured arm at all,
+            # and the ablation test built on it would compare two policies
+            # in a world where neither can do better - then pass or fail on
+            # noise. Loud at construction beats a silently null experiment.
+            raise ValueError(
+                f"favoured_slot {favoured_slot!r} is not one of {tuple(SLOT_ORDER)}"
+            )
+        self.favoured_slot = favoured_slot
+        self.effect = effect
+        self.seed = seed
+        self.sigma = sigma
+        self.reference = reference
+        self._fail_on = fail_on
+        self._rng = random.Random(seed)
+        self.calls: list[tuple[str, tuple[int, ...]]] = []
+        """(config_id, seeds) for every run() call, as on FakeExecutor."""
+
+    def run(self, config: PipelineConfig, seeds: Sequence[int]) -> CandidateResult:
+        requested = tuple(seeds)
+        self.calls.append((config.config_id, requested))
+
+        if self.reference is None:
+            # Latched, not compared: this call IS the reference, so it gets
+            # no effect on this pass or on any later pass with the same
+            # favoured slot.
+            self.reference = config
+
+        failure = self._fail_on(config) if self._fail_on is not None else None
+        if failure is not None:
+            error_class, excerpt = failure
+            return CandidateResult(
+                config_id=config.config_id,
+                status=Status.FAILED,
+                val={},
+                backtest={},
+                error_class=error_class,
+                error_excerpt=excerpt,
+                wall_seconds=FAKE_WALL_SECONDS_PER_SEED * len(requested),
+                tokens_in=FAKE_TOKENS_IN,
+                tokens_out=FAKE_TOKENS_OUT,
+            )
+
+        effect = self.effect if self._touches_favoured_slot(config) else 0.0
+        val: dict[int, Metrics] = {}
+        backtest: dict[int, Metrics] = {}
+        for s in requested:
+            val[s] = metrics_from_delta(effect + self._rng.normalvariate(0.0, self.sigma))
+            # Independently drawn, for the reason FakeExecutor gives: a
+            # candidate can win on one split and lose on the other, and a
+            # fake returning identical numbers makes that untestable.
+            backtest[s] = metrics_from_delta(
+                effect + self._rng.normalvariate(0.0, self.sigma)
+            )
+
+        return CandidateResult(
+            config_id=config.config_id,
+            status=Status.OK,
+            val=val,
+            backtest=backtest,
+            wall_seconds=FAKE_WALL_SECONDS_PER_SEED * len(requested),
+            tokens_in=FAKE_TOKENS_IN,
+            tokens_out=FAKE_TOKENS_OUT,
+        )
+
+    def _touches_favoured_slot(self, config: PipelineConfig) -> bool:
+        """True when this config's favoured slot differs from the reference.
+
+        A missing slot on either side counts as "differs" rather than
+        raising: PipelineConfig requires every slot to be filled for
+        `config_id` to work at all, so an absent one means a test built a
+        partial config on purpose and should get an answer, not a KeyError
+        from inside a double.
+        """
+        reference = self.reference
+        if reference is None:  # pragma: no cover - latched in run() first
+            return False
+        return config.slots.get(self.favoured_slot) != reference.slots.get(
+            self.favoured_slot
+        )
 
 
 # ---------------------------------------------------------------------------
