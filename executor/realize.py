@@ -481,6 +481,95 @@ def _realize_fm(
     return user_ids_score, y_score, scores
 
 
+def _realize_fm_for_test_submission(
+    model_slot: SlotConfig,
+    fit_rows: list[tuple],
+    val_rows: list[tuple],
+    test_rows: list[tuple],
+    seed: int,
+):
+    """Trains vendor's FM on `fit_rows`, early-stopping and MODEL-
+    SELECTING via `val_rows` — the exact same procedure and early-
+    stopping rule as _realize_fm's validation pass — then predicts on
+    `test_rows` using the FINAL selected weights. Returns (user_ids,
+    scores) aligned to `test_rows`, in `test_rows` order. No labels are
+    returned: a real submission has none to report, and this function
+    must not tempt a caller into reading the ones present in this
+    offline copy of the dataset.
+
+    TEST LABELS ARE NEVER READ FOR ANYTHING. `encode()` extracts a label
+    column for every split it's handed, including 'test' — that's a
+    byproduct of encode() not knowing or caring about this distinction —
+    but this function only ever uses test_rows' user_ids and X
+    (features), for alignment and prediction respectively. Which epoch's
+    weights survive (`best_state`) is decided ENTIRELY from `val_rows`,
+    before `test_rows` are touched at all. Scoring test_rows during
+    training to pick an epoch would be exactly the leak
+    harness/validate.py's "read structure, never labels" principle
+    exists to prevent — it would just be a subtler version of it, since
+    nothing about training with test-set early stopping ever LOOKS like
+    reading a label, from the caller's side.
+    """
+    k = model_slot.params.get("k", 16)
+    lr = model_slot.params.get("lr", 0.001)
+    epochs = model_slot.params.get("epochs", 40)
+    bs = model_slot.params.get("bs", 8192)
+    patience = model_slot.params.get("patience", 4)
+
+    splits = {"train": fit_rows, "valid": val_rows, "test": test_rows}
+    enc, dim = _vendor.encode(splits)
+    x_train, y_train, _ = enc["train"]
+    x_val, y_val, user_ids_val = enc["valid"]
+    x_test, _, user_ids_test = enc["test"]  # test labels deliberately discarded
+
+    model = _vendor.FM(dim, k=k, lr=lr, seed=seed)
+    rng = np.random.default_rng(seed)
+    best_primary, best_state, bad = -1.0, None, 0
+    for _ in range(1, epochs + 1):
+        order = rng.permutation(len(y_train))
+        for i in range(0, len(order), bs):
+            batch = order[i : i + bs]
+            model.step(x_train[batch], y_train[batch])
+        # Model selection uses ONLY val_rows — test_rows are never scored
+        # during training, at any epoch.
+        val_result = _vendor.evaluate(user_ids_val, y_val, model.predict(x_val))
+        if val_result["primary"] > best_primary + 1e-5:
+            best_primary, bad = val_result["primary"], 0
+            best_state = (model.V.copy(), model.W.copy(), np.float32(model.b))
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+    model.V, model.W, model.b = best_state
+
+    test_scores = model.predict(x_test)
+    return user_ids_test, test_scores
+
+
+def realize_for_submission(
+    config: PipelineConfig,
+    fit_rows: list[tuple],
+    val_rows: list[tuple],
+    test_rows: list[tuple],
+    seed: int,
+):
+    """Like realize(), but for producing a FINAL submission: trains on
+    `fit_rows` with model selection via `val_rows` (never `test_rows`),
+    then predicts on `test_rows` using the final selected weights.
+    Returns (user_ids, scores) — no labels, unlike realize(), matching
+    _realize_fm_for_test_submission's contract.
+
+    Only model.impl == "fm" is realized, matching realize()'s own scope
+    today; anything else raises NotImplementedError naming it.
+    """
+    model_slot = config.slots["model"]
+    if model_slot.impl != "fm":
+        raise NotImplementedError(
+            f"executor.realize: no submission realization implemented for model impl {model_slot.impl!r}"
+        )
+    return _realize_fm_for_test_submission(model_slot, fit_rows, val_rows, test_rows, seed)
+
+
 def realize(config: PipelineConfig, fit_rows: list[tuple], score_rows: list[tuple], seed: int):
     """Trains `config` on `fit_rows` and returns (user_ids, labels,
     scores) aligned to `score_rows`, in `score_rows` order.

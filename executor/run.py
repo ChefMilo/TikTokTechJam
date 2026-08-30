@@ -84,6 +84,15 @@ def run_candidate(
             )
             backtest_metrics[seed] = metrics.evaluate(bt_user_ids, bt_labels, bt_scores)
 
+            # Mirrors the val save above, same reason: without this the
+            # gate has no cached backtest predictions to rank-average or
+            # otherwise recombine downstream (e.g. an ensemble candidate),
+            # and anything built on top degrades silently rather than
+            # loudly — there is no "backtest_missing"-equivalent warning
+            # for a caller who reads cache.load_predictions("backtest")
+            # expecting it to be there and finds nothing.
+            cache.save_predictions(config_id, seed, "backtest", bt_user_ids, bt_labels, bt_scores)
+
         wall_seconds = time.perf_counter() - start
         if journal is not None:
             journal.log_eval_result(

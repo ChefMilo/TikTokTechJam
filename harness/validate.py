@@ -72,14 +72,31 @@ def _vendor_splits():
     return _vendor_splits_cache
 
 
+def load_split_rows(split: str) -> list[tuple]:
+    """Returns the vendor's own raw rows for `split` ('train', 'val', or
+    'test'), in the vendor's own row order.
+
+    This is the one sanctioned place allowed to hand back TEST rows: row
+    STRUCTURE only (user_id, video_id, ordering — the same 7-tuple shape
+    harness.data.load returns), used to produce aligned predictions for a
+    real submission. harness.data.load("test") remains correctly
+    forbidden for everything else — training, model selection, or
+    anything that would look at test LABELS to make a decision. Callers
+    of this function must not do that either; it is the caller's
+    responsibility to only ever read row structure (user_id, video_id)
+    from what's returned here, never the label field, for test rows.
+    """
+    if split not in _SPLIT_TO_VENDOR_KEY:
+        raise ValueError(f"unknown split {split!r}; expected 'train', 'val', or 'test'")
+    return _vendor_splits()[_SPLIT_TO_VENDOR_KEY[split]]
+
+
 def validate_submission(path: str, split: str = "test") -> bool:
     """Returns True if the submission at `path` is well-formed for
     `split`. Raises ValueError (the vendor's own message, naming the
     specific check that failed) otherwise.
     """
-    if split not in _SPLIT_TO_VENDOR_KEY:
-        raise ValueError(f"unknown split {split!r}; expected 'val' or 'test'")
-    rows = _vendor_splits()[_SPLIT_TO_VENDOR_KEY[split]]
+    rows = load_split_rows(split)
     _vendor.read_submission(str(path), rows)
     return True
 
