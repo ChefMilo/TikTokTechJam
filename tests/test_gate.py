@@ -7,10 +7,14 @@ multiples of gate.SIGMA rather than hardcoding a number, so they stay
 correct if the measured sigma is ever refreshed.
 """
 
+import dataclasses
+import time
+
 import numpy as np
+import pytest
 
 from contracts import CandidateResult, Metrics, Status, Verdict
-from harness import cache, gate, metrics as hmetrics
+from harness import cache, data, gate, metrics as hmetrics
 
 
 def _metrics(primary: float) -> Metrics:
@@ -200,3 +204,107 @@ def test_tiny_same_sign_deltas_are_not_accepted_with_real_per_user_predictions(t
     assert verdict.reason == "ci_includes_zero"
     assert verdict.ci95[0] <= 0.0
     assert "coarse_ci_seed_bootstrap" not in verdict.reason
+
+
+def test_per_user_metrics_reaggregates_to_vendor_primary_on_real_validation_data():
+    """CRITICAL: if this fails, _per_user_metrics's per-user math disagrees
+    with the vendor's, and the entire user-level bootstrap built on top of
+    it is wrong regardless of what any other gate test shows.
+
+    Uses real validation user_ids/labels (real label distribution: real
+    zero-positive/all-positive users, real per-user impression counts,
+    real ties) with fixed-seed random scores standing in for a model —
+    the helper's aggregation math must reproduce the vendor's primary
+    exactly regardless of what scores it's handed.
+    """
+    val_rows = data.load("val")
+    user_ids = np.array([row[1] for row in val_rows])
+    labels = np.array([row[6] for row in val_rows], dtype=np.int64)
+    rng = np.random.default_rng(0)
+    scores = rng.normal(size=len(val_rows))
+
+    unique_users, npos, auc, ndcg = gate._per_user_metrics(user_ids, labels, scores)
+
+    eligible = ~np.isnan(auc)
+    gauc = (npos[eligible] * auc[eligible]).sum() / npos[eligible].sum()
+    ndcg_mean = ndcg.mean()
+    reaggregated_primary = (gauc + ndcg_mean) / 2.0
+
+    vendor_primary = hmetrics.evaluate(user_ids, labels, scores).primary
+
+    assert len(unique_users) == len(set(user_ids))
+    assert abs(reaggregated_primary - vendor_primary) < 1e-9, (
+        f"helper reaggregation {reaggregated_primary} vs vendor {vendor_primary}"
+    )
+
+
+def test_full_confirm_on_real_validation_data_completes_in_under_five_seconds(tmp_path, monkeypatch):
+    """Target from the fix: a full 1000-resample CONFIRM on the real
+    ~125k-row / ~24k-user validation set must run in well under the old
+    ~50-minutes-per-decision cost. Prints the elapsed time so this stays
+    visible in test output, not just behind a pass/fail.
+    """
+    monkeypatch.setattr(cache, "_PREDS_DIR", tmp_path / "preds")
+
+    val_rows = data.load("val")
+    user_ids = np.array([row[1] for row in val_rows])
+    labels = np.array([row[6] for row in val_rows], dtype=np.int64)
+
+    val_metrics_candidate = {}
+    val_metrics_incumbent = {}
+    for seed in (0, 1, 2):
+        rng = np.random.default_rng(seed)
+        incumbent_scores = rng.normal(size=len(val_rows))
+        candidate_scores = incumbent_scores + rng.normal(scale=0.01, size=len(val_rows))
+
+        cache.save_predictions("cand", seed, "val", user_ids, labels, candidate_scores)
+        cache.save_predictions("incu", seed, "val", user_ids, labels, incumbent_scores)
+
+        val_metrics_candidate[seed] = hmetrics.evaluate(user_ids, labels, candidate_scores)
+        val_metrics_incumbent[seed] = hmetrics.evaluate(user_ids, labels, incumbent_scores)
+
+    backtest = {s: _metrics(0.6) for s in (0, 1, 2)}
+    candidate = CandidateResult(
+        config_id="cand", status=Status.OK, val=val_metrics_candidate, backtest=backtest,
+        val_pred_path="artifacts/preds/cand.npz",
+    )
+    incumbent = CandidateResult(
+        config_id="incu", status=Status.OK, val=val_metrics_incumbent, backtest=backtest,
+        val_pred_path="artifacts/preds/incu.npz",
+    )
+
+    start = time.perf_counter()
+    verdict = gate.compare(candidate, incumbent)
+    elapsed = time.perf_counter() - start
+
+    print(f"\nfull CONFIRM on real validation data ({len(val_rows):,} rows, "
+          f"{len(set(user_ids)):,} users, 3 seeds, 1000 resamples): {elapsed:.2f}s")
+
+    assert "coarse_ci_seed_bootstrap" not in verdict.reason
+    assert elapsed < 5.0, f"took {elapsed:.2f}s, target is under 5s"
+
+
+def test_missing_cached_predictions_falls_back_and_warns(tmp_path, monkeypatch):
+    """cache.exists must be the ground truth for the user-level-bootstrap
+    decision, not CandidateResult.val_pred_path. Both candidates below
+    set val_pred_path (proving the field alone is NOT enough to trigger
+    the real bootstrap) but have nothing actually saved in the cache, so
+    the gate must fall back, warn, and tag the reason.
+    """
+    monkeypatch.setattr(cache, "_PREDS_DIR", tmp_path / "preds")
+
+    bump = 10 * gate.SIGMA
+    incumbent = _candidate({0: 0.60, 1: 0.60, 2: 0.60}, {0: 0.55, 1: 0.55, 2: 0.55})
+    candidate = _candidate(
+        {0: 0.60 + bump, 1: 0.60 + bump, 2: 0.60 + bump},
+        {0: 0.55 + bump, 1: 0.55 + bump, 2: 0.55 + bump},
+    )
+    # val_pred_path set on both, but no cache.save_predictions was ever
+    # called — nothing actually exists under tmp_path / "preds".
+    candidate = dataclasses.replace(candidate, val_pred_path="artifacts/preds/cand__0__val.npz")
+    incumbent = dataclasses.replace(incumbent, val_pred_path="artifacts/preds/incu__0__val.npz")
+
+    with pytest.warns(UserWarning, match="cand"):
+        verdict = gate.compare(candidate, incumbent)
+
+    assert "coarse_ci_seed_bootstrap" in verdict.reason

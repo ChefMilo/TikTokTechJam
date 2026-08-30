@@ -10,14 +10,30 @@ Both sub-windows come from harness.data.load("train") only. This module
 must never call data.load("val") or data.load("test"): the whole point is
 to measure the forward-gap effect using data a candidate is already
 allowed to see, not to sneak a second look at validation or test.
+
+BOUNDARY CHOICE — volume shape, not just date arithmetic: daily row
+counts show train is heavily front-loaded (peak 278,835 rows on
+20220411, decaying to a ~20-24k/day plateau by 20220418-21), while
+validation is flat throughout at 14-27k/day — i.e. validation resembles
+the PLATEAU, not the burst. Splitting at BT_FIT_END=20220414 (the
+original boundary) put nearly all of the burst in fit and the
+burst-to-plateau TRANSITION in score, simulating a different regime
+shift than the real train->val one (mixed burst+plateau -> pure
+plateau). Moving the boundary to BT_FIT_END=20220417 puts the whole
+burst plus the early plateau days in fit — matching the real train
+split's own mixed composition — and leaves score
+(20220418-20220421) as pure plateau, matching real validation's shape.
+A change that only looks good against the old boundary's transition
+period, rather than against real steady-state behaviour, is exactly the
+kind of overfitting this backtest exists to catch.
 """
 
 from __future__ import annotations
 
 from harness import data
 
-BT_FIT_END = 20220414
-BT_SCORE_START = 20220415
+BT_FIT_END = 20220417
+BT_SCORE_START = 20220418
 BT_SCORE_END = 20220421
 
 # Row counts of both sub-windows, recorded on first split() call. There is
