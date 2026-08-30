@@ -388,8 +388,11 @@ def test_cli_parses_an_explicit_seed_list():
 
 
 def test_cli_rejects_an_unknown_variant():
+    # Was "crosses" in unit 1, when no such variant existed. Unit 2
+    # registered it, so the example had to become a name that is not a
+    # variant and will not become one. The assertion is unchanged.
     with pytest.raises(SystemExit):
-        run_module._parse_args(["--variant", "crosses"])
+        run_module._parse_args(["--variant", "definitely_not_a_variant"])
 
 
 def test_parse_seeds_rejects_an_empty_list():
@@ -519,3 +522,469 @@ def test_manual_imports_no_other_first_party_package():
                     offenders.append(f"{path.name} imports {name}")
 
     assert offenders == []
+
+
+# ---------------------------------------------------------------------------
+# UNIT 2: user-side x item-side cross columns
+# ---------------------------------------------------------------------------
+
+
+class _FakeFrame:
+    """The two operations SideTables.from_frames uses, and nothing else.
+
+    A stand-in for a pandas DataFrame so these tests neither build one nor
+    read a CSV: `.columns`, and the
+    `frame[[cols]].itertuples(index=False)` access pattern.
+    """
+
+    def __init__(self, records, columns):
+        self._records = records
+        self.columns = list(columns)
+
+    def __getitem__(self, wanted):
+        rows = [tuple(record[column] for column in wanted) for record in self._records]
+        return _FakeSelection(rows)
+
+
+class _FakeSelection:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def itertuples(self, index=False):
+        return iter(self._rows)
+
+
+def _side_tables():
+    """Synthetic side tables covering the three crosses' columns.
+
+    u1/u2/u3 are present. Other tests deliberately encode rows for ids the
+    tables do not contain, which must degrade to MISSING rather than crash.
+    """
+    user_frame = _FakeFrame(
+        [
+            {"user_id": "u1", "user_active_degree": "full_active",
+             "register_days_range": "730+", "watch_ratio": 0.1},
+            {"user_id": "u2", "user_active_degree": "middle_active",
+             "register_days_range": "[31,60)", "watch_ratio": 0.5},
+            {"user_id": "u3", "user_active_degree": "full_active",
+             "register_days_range": "[31,60)", "watch_ratio": 0.9},
+        ],
+        ["user_id", "user_active_degree", "register_days_range", "watch_ratio"],
+    )
+    video_frame = _FakeFrame(
+        [
+            {"video_id": "v1", "video_type": "NORMAL"},
+            {"video_id": "v2", "video_type": "AD"},
+            {"video_id": "v3", "video_type": "NORMAL"},
+            {"video_id": "v4", "video_type": "NORMAL"},
+            {"video_id": "v5", "video_type": "AD"},
+            {"video_id": "v6", "video_type": "NORMAL"},
+            {"video_id": "v7", "video_type": "NORMAL"},
+            {"video_id": "v8", "video_type": "AD"},
+        ],
+        ["video_id", "video_type"],
+    )
+    return encode_module.SideTables.from_frames(
+        user_frame,
+        video_frame,
+        encode_module.CROSS_USER_COLUMNS,
+        encode_module.CROSS_VIDEO_COLUMNS,
+    )
+
+
+def test_side_tables_key_on_strings_so_int_ids_still_match():
+    """Rows carry ids as strings; pandas reads the side tables' id columns
+    as int64. Unconverted, every lookup would miss and every cross would be
+    MISSING — a total failure that still trains and still reports a
+    plausible number."""
+    user_frame = _FakeFrame(
+        [{"user_id": 7, "user_active_degree": "full_active"}],
+        ["user_id", "user_active_degree"],
+    )
+    video_frame = _FakeFrame(
+        [{"video_id": 9, "video_type": "NORMAL"}], ["video_id", "video_type"]
+    )
+
+    tables = encode_module.SideTables.from_frames(
+        user_frame, video_frame, ("user_active_degree",), ("video_type",)
+    )
+
+    assert tables.user["7"]["user_active_degree"] == "full_active"
+    assert tables.video["9"]["video_type"] == "NORMAL"
+
+
+def test_the_three_crosses_are_the_ones_the_design_calls_for():
+    """Each pairs a user-side attribute with an item-side one. Crossing two
+    baseline fields would be redundant — the FM's bilinear term already
+    models every pair among them."""
+    names = [spec.name for spec in encode_module.CROSS_SPECS]
+    assert names == [
+        "user_active_degree_x_video_type",
+        "user_active_degree_x_dur_bucket",
+        "register_days_range_x_video_type",
+    ]
+    for spec in encode_module.CROSS_SPECS:
+        assert spec.user_term.kind == "user_table"
+        assert spec.item_term.kind in {"video_table", "row_field"}
+
+
+def test_crosses_append_three_columns_and_leave_the_baseline_five_identical():
+    """The load-bearing additivity check. If a baseline column shifted, the
+    gate's verdict would stop being attributable to the crosses alone."""
+    splits = {"train": _train_rows(), "valid": _val_rows()}
+
+    plain, plain_dim = encode_module.encode(splits)
+    widened, widened_dim = encode_module.encode(
+        splits, crosses=encode_module.CROSS_SPECS, side_tables=_side_tables()
+    )
+
+    for name in splits:
+        plain_x, plain_y, plain_users = plain[name]
+        wide_x, wide_y, wide_users = widened[name]
+        assert wide_x.shape == (len(splits[name]), 8)
+        assert wide_x.dtype == np.int32
+        assert wide_y.dtype == np.float32
+        assert np.array_equal(wide_x[:, :5], plain_x), name
+        assert np.array_equal(wide_y, plain_y), name
+        assert wide_users == plain_users, name
+
+    assert widened_dim > plain_dim
+
+
+def test_the_widened_encoder_still_matches_the_vendor_on_the_baseline_columns():
+    """Unit 1's fidelity guarantee must survive the extension."""
+    splits = {"train": _train_rows(), "valid": _val_rows()}
+    widened, _ = encode_module.encode(
+        splits, crosses=encode_module.CROSS_SPECS, side_tables=_side_tables()
+    )
+    theirs, _ = vendor.encode(splits)
+
+    for name in theirs:
+        assert np.array_equal(widened[name][0][:, :5], theirs[name][0]), name
+
+
+def test_cross_columns_occupy_their_own_disjoint_id_ranges():
+    splits = {"train": _train_rows(), "valid": _val_rows()}
+    enc, dim = encode_module.encode(
+        splits, crosses=encode_module.CROSS_SPECS, side_tables=_side_tables()
+    )
+
+    x_train, _, _ = enc["train"]
+    x_val, _, _ = enc["valid"]
+    assert x_train.max() < dim and x_val.max() < dim
+
+    # One shared table, non-overlapping blocks: every column's ids sit
+    # strictly above the previous column's.
+    for column in range(1, 8):
+        assert x_train[:, column].min() > x_train[:, column - 1].max(), column
+
+
+def test_a_cross_pair_seen_only_at_score_time_lands_in_the_unk_slot():
+    """Leakage guard. An unseen pair must never mint a new id — that would
+    index past the embedding table and hand an untrained parameter to a
+    combination the model has never seen."""
+    train_rows = [
+        _row(20220410, "u1", "v1", "a1", "t1", 1000.0, 1),  # full_active x NORMAL
+        _row(20220410, "u1", "v2", "a1", "t1", 2000.0, 0),  # full_active x AD
+        _row(20220411, "u1", "v3", "a2", "t2", 3000.0, 1),
+        _row(20220411, "u1", "v4", "a2", "t1", 4000.0, 0),
+    ]
+    # u2 is middle_active, so middle_active x AD never occurs in train.
+    val_rows = [
+        _row(20220423, "u1", "v1", "a1", "t1", 1500.0, 1),
+        _row(20220423, "u2", "v2", "a1", "t1", 2500.0, 0),
+    ]
+
+    enc, _ = encode_module.encode(
+        {"train": train_rows, "valid": val_rows},
+        crosses=(encode_module.CROSS_SPECS[0],),
+        side_tables=_side_tables(),
+    )
+    x_train, _, _ = enc["train"]
+    x_val, _, _ = enc["valid"]
+
+    cross_column = 5  # five baseline fields, then this one
+    train_ids = set(x_train[:, cross_column].tolist())
+    unk_id = max(train_ids) + 1  # the UNK slot sits after the known values
+
+    assert x_val[0, cross_column] in train_ids  # full_active x NORMAL was seen
+    assert x_val[1, cross_column] == unk_id  # middle_active x AD was not
+    assert x_val[1, cross_column] not in train_ids
+
+
+def test_cross_vocabularies_are_fit_on_the_fitting_window_only():
+    """Encoding with and without a scoring split must give the fitting
+    window byte-identical ids — otherwise the score window's values are
+    leaking into the vocabulary."""
+    train_rows = _train_rows()
+
+    only_train, dim_a = encode_module.encode(
+        {"train": train_rows},
+        crosses=encode_module.CROSS_SPECS,
+        side_tables=_side_tables(),
+    )
+    with_score, dim_b = encode_module.encode(
+        {"train": train_rows, "valid": _val_rows()},
+        crosses=encode_module.CROSS_SPECS,
+        side_tables=_side_tables(),
+    )
+
+    assert dim_a == dim_b
+    assert np.array_equal(only_train["train"][0], with_score["train"][0])
+
+
+def test_a_user_or_video_absent_from_a_side_table_degrades_to_missing():
+    """Robustness: the interaction log is the source of truth for which
+    rows exist, so an id with no side-table record must encode, not
+    crash."""
+    train_rows = [
+        _row(20220410, "u1", "v1", "a1", "t1", 1000.0, 1),
+        _row(20220410, "u404", "v1", "a1", "t1", 2000.0, 0),  # unknown user
+        _row(20220411, "u1", "v404", "a2", "t2", 3000.0, 1),  # unknown video
+        _row(20220411, "u404", "v404", "a2", "t1", 4000.0, 0),  # both unknown
+    ]
+
+    enc, dim = encode_module.encode(
+        {"train": train_rows},
+        crosses=encode_module.CROSS_SPECS,
+        side_tables=_side_tables(),
+    )
+
+    x_train, _, _ = enc["train"]
+    assert x_train.shape == (4, 8)
+    assert x_train.max() < dim
+    # An unknown user encodes to a different cross value than a known one.
+    assert x_train[1, 5] != x_train[0, 5]
+
+
+def test_missing_side_values_still_earn_an_id_when_they_recur_in_train():
+    """MISSING is a real category, not a discard: recurring in the fitting
+    window earns it an embedding rather than forcing it into UNK."""
+    train_rows = [
+        _row(20220410, "u404", "v1", "a1", "t1", 1000.0, 1),
+        _row(20220411, "u404", "v1", "a1", "t2", 2000.0, 0),
+    ]
+    val_rows = [_row(20220423, "u404", "v1", "a1", "t1", 1500.0, 1)]
+
+    enc, _ = encode_module.encode(
+        {"train": train_rows, "valid": val_rows},
+        crosses=(encode_module.CROSS_SPECS[0],),
+        side_tables=_side_tables(),
+    )
+
+    train_ids = set(enc["train"][0][:, 5].tolist())
+    assert enc["valid"][0][0, 5] in train_ids
+
+
+def test_encode_refuses_a_cross_when_no_side_tables_were_supplied():
+    with pytest.raises(ValueError):
+        encode_module.encode(
+            {"train": _train_rows()},
+            crosses=encode_module.CROSS_SPECS,
+            side_tables=None,
+        )
+
+
+def test_a_cross_naming_an_unknown_row_field_is_rejected():
+    bogus = encode_module.CrossSpec(
+        "bogus",
+        encode_module.Term("user_table", "user_active_degree"),
+        encode_module.Term("row_field", "no_such_field"),
+    )
+    with pytest.raises(KeyError):
+        encode_module.encode(
+            {"train": _train_rows()}, crosses=(bogus,), side_tables=_side_tables()
+        )
+
+
+def test_side_tables_reject_a_missing_column():
+    user_frame = _FakeFrame([{"user_id": "u1"}], ["user_id"])
+    video_frame = _FakeFrame([{"video_id": "v1"}], ["video_id"])
+    with pytest.raises(KeyError):
+        encode_module.SideTables.from_frames(
+            user_frame, video_frame, ("user_active_degree",), ()
+        )
+
+
+def _continuous_cross_tables():
+    return encode_module.SideTables.from_frames(
+        _FakeFrame(
+            [
+                {"user_id": "u1", "watch_ratio": 0.1},
+                {"user_id": "u2", "watch_ratio": 0.5},
+                {"user_id": "u3", "watch_ratio": 0.9},
+            ],
+            ["user_id", "watch_ratio"],
+        ),
+        _FakeFrame(
+            [{"video_id": f"v{i}", "video_type": "NORMAL"} for i in range(1, 9)],
+            ["video_id", "video_type"],
+        ),
+        ("watch_ratio",),
+        ("video_type",),
+    )
+
+
+def test_a_continuous_side_feature_is_bucketed_rather_than_used_raw():
+    """None of the three shipped crosses has a continuous half, so the
+    bucketing path is proven here on a synthetic column — otherwise it
+    would be dead code that unit 3 discovers is broken."""
+    continuous = encode_module.CrossSpec(
+        "watch_ratio_x_video_type",
+        encode_module.Term("user_table", "watch_ratio", buckets=2),
+        encode_module.Term("video_table", "video_type"),
+    )
+
+    enc, _ = encode_module.encode(
+        {"train": _train_rows()},
+        crosses=(continuous,),
+        side_tables=_continuous_cross_tables(),
+    )
+    x_train, _, _ = enc["train"]
+
+    train_rows = _train_rows()
+    u1_row = next(i for i, row in enumerate(train_rows) if row[1] == "u1")
+    u3_row = next(i for i, row in enumerate(train_rows) if row[1] == "u3")
+    # 0.1 and 0.9 straddle the median edge, so they must land in different
+    # buckets and therefore different cross ids.
+    assert x_train[u1_row, 5] != x_train[u3_row, 5]
+
+
+def test_continuous_bucket_edges_are_fit_on_the_fitting_window_only():
+    """Adding a scoring split must not move the fitting window's buckets."""
+    continuous = encode_module.CrossSpec(
+        "watch_ratio_x_video_type",
+        encode_module.Term("user_table", "watch_ratio", buckets=2),
+        encode_module.Term("video_table", "video_type"),
+    )
+    tables = _continuous_cross_tables()
+    train_rows = _train_rows()
+
+    only_train, _ = encode_module.encode(
+        {"train": train_rows}, crosses=(continuous,), side_tables=tables
+    )
+    with_score, _ = encode_module.encode(
+        {"train": train_rows, "valid": _val_rows()},
+        crosses=(continuous,),
+        side_tables=tables,
+    )
+
+    assert np.array_equal(only_train["train"][0], with_score["train"][0])
+
+
+# ---------------------------------------------------------------------------
+# The crosses variant and the gate comparison
+# ---------------------------------------------------------------------------
+
+
+def test_crosses_is_registered_with_its_own_config_id():
+    assert run_module.VARIANTS["crosses"] is run_module.run_crosses
+    assert run_module.MANUAL_CROSSES_CONFIG_ID != run_module.MANUAL_BASELINE_CONFIG_ID
+
+
+def test_run_crosses_caches_under_its_own_id_and_returns_a_result(
+    fake_harness, monkeypatch
+):
+    monkeypatch.setattr(run_module, "load_side_tables", _side_tables)
+    seeds = (0, 1)
+
+    result = run_module.run_crosses(seeds=seeds, hyperparams=TINY_HYPERPARAMS)
+
+    assert isinstance(result, CandidateResult)
+    assert result.status is Status.OK
+    assert result.config_id == run_module.MANUAL_CROSSES_CONFIG_ID
+    assert set(result.val) == set(seeds)
+    assert set(result.backtest) == set(seeds)
+
+    saved = fake_harness["saved"]
+    assert [entry[0] for entry in saved] == [run_module.MANUAL_CROSSES_CONFIG_ID] * 2
+    assert [entry[1] for entry in saved] == list(seeds)
+    assert {entry[2] for entry in saved} == {"val"}
+
+
+def test_run_crosses_loads_the_side_tables_through_harness(fake_harness, monkeypatch):
+    """Not by reading the CSVs itself — harness.data.load_side_features is
+    the only sanctioned door to those two files."""
+    calls = []
+
+    def spy():
+        calls.append(1)
+        return _side_tables()
+
+    monkeypatch.setattr(run_module, "load_side_tables", spy)
+    run_module.run_crosses(seeds=(0,), hyperparams=TINY_HYPERPARAMS)
+
+    assert len(calls) == 1
+
+
+def test_the_comparison_path_surfaces_every_verdict_field(
+    fake_harness, monkeypatch, capsys
+):
+    """crosses vs baseline, end to end through gate.compare."""
+    monkeypatch.setattr(run_module, "load_side_tables", _side_tables)
+    # No cached baseline predictions here, so the incumbent takes the
+    # full re-run path.
+    monkeypatch.setattr(run_module.cache, "exists", lambda *a, **k: False)
+    seeds = (0, 1, 2)
+
+    candidate = run_module.run_crosses(seeds=seeds, hyperparams=TINY_HYPERPARAMS)
+    incumbent, provenance = run_module.baseline_incumbent(
+        seeds=seeds, hyperparams=TINY_HYPERPARAMS
+    )
+
+    assert "re-run" in provenance
+    assert incumbent.config_id == run_module.MANUAL_BASELINE_CONFIG_ID
+    assert set(incumbent.backtest) == set(seeds)
+
+    report_module.print_comparison(candidate, incumbent, label="crosses vs baseline")
+    out = capsys.readouterr().out
+    for field in ("accept", "delta", "ci95", "n_seeds", "backtest_delta", "reason"):
+        assert field in out
+
+
+def test_the_incumbent_reuses_cached_validation_predictions_when_present(
+    fake_harness, monkeypatch
+):
+    """The point of caching: no validation retrain for the incumbent. The
+    backtest half is still re-run, and the provenance string says so."""
+    val_rows = _val_rows()
+    cached_scores = np.linspace(0.0, 1.0, len(val_rows)).astype(np.float32)
+
+    monkeypatch.setattr(run_module.cache, "exists", lambda *a, **k: True)
+    monkeypatch.setattr(
+        run_module.cache,
+        "load_predictions",
+        lambda config_id, seed, split: (
+            np.array([row[1] for row in val_rows]),
+            np.array([row[6] for row in val_rows], dtype=np.int8),
+            cached_scores,
+        ),
+    )
+
+    incumbent, provenance = run_module.baseline_incumbent(
+        seeds=(0, 1, 2), hyperparams=TINY_HYPERPARAMS
+    )
+
+    assert "cached" in provenance
+    assert set(incumbent.val) == {0, 1, 2}
+    assert set(incumbent.backtest) == {0, 1, 2}
+    # The incumbent path must not overwrite the predictions it just read.
+    assert fake_harness["saved"] == []
+
+
+def test_cli_accepts_the_crosses_variant_with_a_comparison():
+    args = run_module._parse_args(
+        ["--variant", "crosses", "--seeds", "0,1,2", "--compare-to", "baseline"]
+    )
+    assert args.variant == "crosses"
+    assert args.compare_to == "baseline"
+    assert run_module.parse_seeds(args.seeds) == (0, 1, 2)
+
+
+def test_cli_comparison_defaults_to_off():
+    assert run_module._parse_args([]).compare_to is None
+
+
+def test_cli_rejects_an_unknown_comparison_target():
+    with pytest.raises(SystemExit):
+        run_module._parse_args(["--compare-to", "not_a_variant"])
