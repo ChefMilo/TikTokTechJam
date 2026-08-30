@@ -253,9 +253,11 @@ def test_the_agent_almost_never_accepts_noise(null_experiment, capsys):
     # a passing dot. `-s` or a failure will surface it.
     with capsys.disabled():
         print(
-            f"\n  FALSE-POSITIVE RATE (null executor, real harness gate): "
-            f"{false_positives}/{comparisons} = {rate:.4f}"
+            f"\n  FALSE-POSITIVE RATE — integration, seed-level fallback CI "
+            f"(no cached preds): {false_positives}/{comparisons} = {rate:.4f}"
             f"  [bound {FALSE_POSITIVE_BOUND}, {RUNS} runs x {SEEDS} seeds]"
+            f"\n  (production user-level CI is measured separately in "
+            f"tests/test_gate_false_positive_rate.py)"
         )
 
     assert comparisons >= MIN_COMPARISONS, (
