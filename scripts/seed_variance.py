@@ -120,6 +120,11 @@ def main():
         "split": "val",
         "per_seed": per_seed,
         "summary": summary,
+        # Top-level, not just nested under summary["primary"]["std"]:
+        # harness/gate.py reads this exact key to calibrate the noise
+        # gate's acceptance threshold, so it needs a stable, unnested path
+        # rather than reaching into summary's structure.
+        "sigma_primary": primary_std,
         "organizers_test_primary_std": ORGANIZERS_TEST_PRIMARY_STD,
         "convergence_epsilon": CONVERGENCE_EPSILON,
         "epsilon_over_measured_sigma": epsilon_over_sigma,

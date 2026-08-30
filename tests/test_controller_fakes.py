@@ -688,8 +688,8 @@ def test_delta_gate_accept_flag_is_independent_of_significance():
 
 def test_scripted_gate_returns_verdicts_in_order_and_records_calls():
     verdicts = [
-        Verdict(accept=True, delta=0.01, ci95=(0.005, 0.015), backtest_delta=0.01, reason="a"),
-        Verdict(accept=False, delta=0.0, ci95=(-0.01, 0.01), backtest_delta=0.0, reason="b"),
+        Verdict(accept=True, delta=0.01, ci95=(0.005, 0.015), n_seeds=1, backtest_delta=0.01, reason="a"),
+        Verdict(accept=False, delta=0.0, ci95=(-0.01, 0.01), n_seeds=1, backtest_delta=0.0, reason="b"),
     ]
     gate = ScriptedGate(verdicts)
 
@@ -704,7 +704,7 @@ def test_scripted_gate_raises_rather_than_repeating_its_last_verdict():
     """Repeating would let a test assert on a convergence window it never
     actually specified."""
     gate = ScriptedGate(
-        [Verdict(accept=True, delta=0.0, ci95=(0.0, 0.0), backtest_delta=0.0, reason="only")]
+        [Verdict(accept=True, delta=0.0, ci95=(0.0, 0.0), n_seeds=1, backtest_delta=0.0, reason="only")]
     )
     gate.compare(_result(), _result())
 

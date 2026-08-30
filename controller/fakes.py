@@ -702,12 +702,20 @@ class _ConstantGate:
         backtest_delta = _paired_delta(candidate.backtest, incumbent.backtest)
         # 1.96 sigma: nominal-width placeholder so the tuple is plausible.
         half_width = 1.96 * BASELINE_SIGMA
+        # Same shared-seed set _paired_delta itself pairs `delta` over —
+        # this is the real evidence count behind the verdict, not a
+        # placeholder like DeltaGate's below.
+        n_seeds = len(set(candidate.val) & set(incumbent.val))
         return Verdict(
             accept=self._ACCEPT,
             delta=delta,
             ci95=(delta - half_width, delta + half_width),
-            # Required float, never None — CandidateResult.backtest is
-            # itself required, so there is no "no backtest" case to model.
+            n_seeds=n_seeds,
+            # Optional[float] — None means no backtest was run (screen
+            # stage, or a candidate that failed before backtesting).
+            # This fake always has backtest data for both candidate and
+            # incumbent, so it always computes a real delta here; it does
+            # not model the "no backtest ran" case.
             backtest_delta=backtest_delta,
             reason=self._REASON,
         )
@@ -817,6 +825,11 @@ class DeltaGate:
             accept=self.accept,
             delta=self.delta,
             ci95=(self.delta - self.half_width, self.delta + self.half_width),
+            # This gate is a fixed-number script, not a per-seed pairing
+            # (it doesn't touch candidate.val/incumbent.val at all) — it
+            # has no real seed count to report. 1 is a screen-stage
+            # stand-in, not a claim that a 1-seed run actually happened.
+            n_seeds=1,
             # Mirrors the validation delta: these doubles do not model a
             # candidate that wins on one split and loses on the other.
             backtest_delta=self.delta,

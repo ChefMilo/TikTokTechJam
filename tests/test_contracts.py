@@ -139,6 +139,7 @@ def _verdict() -> Verdict:
         accept=True,
         delta=0.0031,
         ci95=(0.0009, 0.0053),
+        n_seeds=5,
         backtest_delta=0.0024,
         reason="paired CI excludes zero on 5 seeds",
     )
@@ -177,6 +178,7 @@ def test_verdict_constructs_and_is_frozen():
     assert verdict.accept is True
     assert verdict.delta == 0.0031
     assert verdict.ci95 == (0.0009, 0.0053)
+    assert verdict.n_seeds == 5
     assert verdict.backtest_delta == 0.0024
     assert verdict.reason == "paired CI excludes zero on 5 seeds"
 

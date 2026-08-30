@@ -1144,6 +1144,9 @@ class _AlternatingGate:
             accept=accept,
             delta=self.delta,
             ci95=(self.delta - self._half_width, self.delta + self._half_width),
+            # Fixed-number script like DeltaGate, not a per-seed pairing —
+            # no real seed count to report; 1 is a screen-stage stand-in.
+            n_seeds=1,
             backtest_delta=self.delta,
             reason=f"_AlternatingGate: accept={accept} (test double)",
         )
