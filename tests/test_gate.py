@@ -238,11 +238,17 @@ def test_per_user_metrics_reaggregates_to_vendor_primary_on_real_validation_data
     )
 
 
-def test_full_confirm_on_real_validation_data_completes_in_under_five_seconds(tmp_path, monkeypatch):
+def test_full_confirm_on_real_validation_data_completes_in_seconds_not_minutes(tmp_path, monkeypatch):
     """Target from the fix: a full 1000-resample CONFIRM on the real
-    ~125k-row / ~24k-user validation set must run in well under the old
+    ~125k-row / ~24k-user validation set must run in seconds, not the old
     ~50-minutes-per-decision cost. Prints the elapsed time so this stays
     visible in test output, not just behind a pass/fail.
+
+    The budget (12s) is deliberately loose. The point being verified is
+    "seconds, not ~50 minutes" — a bound tight enough to distinguish 4s
+    from 8s adds nothing to that and only buys flakiness: this measured
+    4.07-4.72s in isolation but 5.32-5.41s under full-suite load, so 5s
+    flaked twice for a distinction the test was never meant to make.
     """
     monkeypatch.setattr(cache, "_PREDS_DIR", tmp_path / "preds")
 
@@ -281,7 +287,7 @@ def test_full_confirm_on_real_validation_data_completes_in_under_five_seconds(tm
           f"{len(set(user_ids)):,} users, 3 seeds, 1000 resamples): {elapsed:.2f}s")
 
     assert "coarse_ci_seed_bootstrap" not in verdict.reason
-    assert elapsed < 5.0, f"took {elapsed:.2f}s, target is under 5s"
+    assert elapsed < 12.0, f"took {elapsed:.2f}s, target is under 12s"
 
 
 def test_missing_cached_predictions_falls_back_and_warns(tmp_path, monkeypatch):

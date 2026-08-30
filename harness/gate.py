@@ -241,8 +241,8 @@ def _bootstrap_ci_user_level(
     batches those resamples (_resampled_primary_batch, _BOOTSTRAP_CHUNK
     at a time) rather than looping one resample at a time in Python —
     on the full real validation set (~125k rows, ~22k users, 3 seeds)
-    that brings a full CONFIRM to ~3.7s (see
-    test_full_confirm_on_real_validation_data_completes_in_under_five_seconds).
+    that brings a full CONFIRM to ~4-5s (see
+    test_full_confirm_on_real_validation_data_completes_in_seconds_not_minutes).
     """
     per_seed_stats: dict[int, tuple] = {}
     for seed in matched_seeds:
