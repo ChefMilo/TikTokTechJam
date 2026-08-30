@@ -170,20 +170,26 @@ class ExecutorPort(Protocol):
 class GatePort(Protocol):
     """Decides whether a candidate genuinely beats the incumbent (W1).
 
-    KNOWN DISCREPANCY WITH harness/gate.py — DELIBERATE.
-    As of this writing harness/gate.py exposes only
-    `passes_gate(*args, **kwargs)`, which has no body and returns None.
-    Nothing anywhere in the repo returns a `Verdict`. So this Protocol is
-    **the shape the Controller needs**, not a description of a shape that
-    exists: it is a standing request to W1, written down in code where it
-    cannot be forgotten.
+    RESOLVED: harness/gate.py NOW SATISFIES THIS PORT.
+    This docstring previously recorded a known discrepancy — that
+    harness/gate.py exposed only `passes_gate(*args, **kwargs)`, which had
+    no body and returned None, and that nothing in the repo returned a
+    `Verdict`. That was true when written and has not been true since
+    harness/gate.py grew a real `compare`. The port was deliberately left
+    unadapted to the stub back then, on the grounds that bending it to an
+    untyped `*args` would erase the request and leave the Controller
+    consuming a bare bool — discarding `delta` and `ci95`, the two numbers
+    convergence tracking is built on. W1 moved to this shape instead,
+    which is how it should have gone.
 
-    It is deliberately NOT adapted to fit the current stub. Bending the
-    port to match `passes_gate`'s untyped `*args` would erase the request
-    and leave the Controller consuming a bare bool — which discards
-    `delta` and `ci95`, the two numbers convergence tracking is built on.
-    The mismatch is known, is tracked, and should be resolved by
-    harness/gate.py moving to this shape.
+    IT IS A MODULE, NOT A CLASS, AND THAT IS FINE. harness.gate exposes
+    `compare` as a module-level function, so the MODULE OBJECT itself
+    satisfies this Protocol — `Controller(gate=harness.gate, ...)` needs no
+    adapter, and a module-level function binds no `self`, so the signature
+    matches exactly. Protocols are structural; nothing here requires a
+    class. tests/test_false_positive_rate.py wires the real gate in exactly
+    this way and asserts the isinstance, so the claim is checked rather
+    than asserted in prose.
     """
 
     def compare(self, candidate: CandidateResult, incumbent: CandidateResult) -> Verdict:
