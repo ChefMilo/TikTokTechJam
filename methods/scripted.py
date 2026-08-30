@@ -105,8 +105,8 @@ _MOVES: tuple[tuple[SlotConfig, HypothesisPayload], ...] = (
     # 2. recency_weight_exp — strongest, data-grounded hypothesis.
     _move(
         target_slot="weighting",
-        impl="recency_exp_decay",
-        params={"date_field": "date", "halflife_days": 7},
+        impl="exp_decay",
+        params={"half_life_days": 5.0},
         rationale=(
             "Train volume is heavily front-loaded — 278,835 rows on "
             "20220411 decaying to ~20-24k/day by 20220418 — while "
@@ -127,8 +127,8 @@ _MOVES: tuple[tuple[SlotConfig, HypothesisPayload], ...] = (
     # 3. recency_window — the blunt version of move 2.
     _move(
         target_slot="data_view",
-        impl="recency_window",
-        params={"date_field": "date", "window_days": 7},
+        impl="recent_window",
+        params={"days": 7},
         rationale=(
             "The blunt version of move 2: a hard cutoff so training only "
             "ever sees the plateau regime validation resembles, instead "
@@ -239,7 +239,7 @@ _MOVES: tuple[tuple[SlotConfig, HypothesisPayload], ...] = (
     _move(
         target_slot="objective",
         impl="bpr",
-        params={"loss": "bpr", "negative_sampling": "in_batch"},
+        params={"pairs_per_batch": 8192},
         rationale=(
             "GAUC and nDCG@5 are both ranking metrics evaluated within a "
             "user's own impressions, but the baseline trains pointwise "

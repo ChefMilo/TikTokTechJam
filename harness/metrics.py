@@ -12,6 +12,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import numpy as np
+
 from contracts import Metrics
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -47,11 +49,31 @@ def evaluate(user_ids, labels, scores, k: int = 5) -> Metrics:
     we want that divergence to fail immediately, not silently skew every
     downstream ranking decision.
     """
+    # Upcast labels here, once, for every caller: harness/cache.py stores
+    # labels as int8 on disk (correct for that schema — each value is
+    # 0/1), but vendor evaluate()'s internal per-user arithmetic
+    # (npos * (npos + 1) inside auc()) is computed in whatever dtype
+    # it's handed. A real validation user has npos=24 — 24*25=600
+    # overflows int8's -128..127 range — which silently produced
+    # GAUC=inf/NaN the first time a script read cached predictions back
+    # and called evaluate() directly on them, undetected until printed.
+    # harness/gate.py's bootstrap already upcasts before resampling for
+    # the same reason; fixing it here too, centrally, means no future
+    # caller has to remember to.
+    labels = np.asarray(labels, dtype=np.int64)
     vendor_result = _vendor.evaluate(user_ids, labels, scores, k=k)
+    # Cast to plain float here, once, for every caller: when `scores` is a
+    # numpy array (as it always is coming out of a real model), vendor
+    # evaluate()'s internal arithmetic on numpy scalars propagates
+    # numpy.float32/float64 into its returned dict instead of Python
+    # floats. Metrics is a shared contract type — it must not leak a
+    # numpy-specific dtype into every downstream consumer (json.dumps,
+    # in particular, rejects numpy floats outright; this surfaced as a
+    # journal-write crash after 5+ minutes of real training).
     metrics = Metrics(
         values={
-            "GAUC": vendor_result["GAUC"],
-            f"nDCG@{k}": vendor_result[f"nDCG@{k}"],
+            "GAUC": float(vendor_result["GAUC"]),
+            f"nDCG@{k}": float(vendor_result[f"nDCG@{k}"]),
         }
     )
     # Explicit raise, not assert — must survive python -O. This is a

@@ -42,6 +42,27 @@ def test_identical_candidate_is_rejected_with_ci_spanning_zero():
 
     assert verdict.accept is False
     assert verdict.ci95[0] <= 0.0 <= verdict.ci95[1]
+    assert verdict.reason.startswith("ci_includes_zero")
+
+
+def test_candidate_worse_by_ten_sigma_is_rejected_as_ci_entirely_negative():
+    """Distinct from the identical-candidate case above: this interval
+    doesn't straddle zero, it sits entirely below it — the candidate
+    isn't statistically indistinguishable from the incumbent, it's
+    worse. The two must not share a reason string (judges read these
+    directly from the journal)."""
+    bump = 10 * gate.SIGMA
+    incumbent = _candidate({0: 0.60, 1: 0.60, 2: 0.60}, {0: 0.55, 1: 0.55, 2: 0.55})
+    candidate = _candidate(
+        {0: 0.60 - bump, 1: 0.60 - bump, 2: 0.60 - bump},
+        {0: 0.55 - bump, 1: 0.55 - bump, 2: 0.55 - bump},
+    )
+
+    verdict = gate.compare(candidate, incumbent)
+
+    assert verdict.accept is False
+    assert verdict.ci95[1] < 0.0
+    assert verdict.reason.startswith("ci_entirely_negative")
 
 
 def test_candidate_better_by_ten_sigma_on_every_seed_is_accepted():

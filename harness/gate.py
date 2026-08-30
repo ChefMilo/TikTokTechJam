@@ -402,8 +402,15 @@ def _confirm(candidate: CandidateResult, incumbent: CandidateResult) -> Verdict:
     backtest_delta = _backtest_delta(candidate, incumbent)
     n_seeds = len(matched_seeds)
 
-    if ci95[0] <= 0:
+    if ci95[0] <= 0 <= ci95[1]:
         accept, reason = False, "ci_includes_zero"
+    elif ci95[1] < 0:
+        # Distinct from "includes zero": this interval is entirely
+        # negative — the candidate isn't merely statistically
+        # indistinguishable from the incumbent, it's worse. The journal
+        # is a graded deliverable and judges read these reason strings
+        # directly, so the two must not share a label.
+        accept, reason = False, "ci_entirely_negative"
     elif backtest_delta is None:
         accept, reason = False, "backtest_missing"
     elif backtest_delta <= 0:
