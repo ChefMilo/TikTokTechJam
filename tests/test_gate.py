@@ -7,8 +7,10 @@ multiples of gate.SIGMA rather than hardcoding a number, so they stay
 correct if the measured sigma is ever refreshed.
 """
 
+import numpy as np
+
 from contracts import CandidateResult, Metrics, Status, Verdict
-from harness import gate
+from harness import cache, gate, metrics as hmetrics
 
 
 def _metrics(primary: float) -> Metrics:
@@ -64,7 +66,10 @@ def test_better_validation_negative_backtest_is_rejected_as_backtest_negative():
     verdict = gate.compare(candidate, incumbent)
 
     assert verdict.accept is False
-    assert verdict.reason == "backtest_negative"
+    # No val_pred_path set on these synthetic candidates, so the gate
+    # falls back to the seed-level bootstrap and tags the reason with it
+    # (see harness/gate.py's "Never silently degrade" comment).
+    assert verdict.reason.startswith("backtest_negative")
 
 
 def test_empty_backtest_is_rejected_as_backtest_missing():
@@ -75,7 +80,7 @@ def test_empty_backtest_is_rejected_as_backtest_missing():
     verdict = gate.compare(candidate, incumbent)
 
     assert verdict.accept is False
-    assert verdict.reason == "backtest_missing"
+    assert verdict.reason.startswith("backtest_missing")
     assert verdict.backtest_delta is None
 
 
@@ -130,3 +135,68 @@ def test_clears_convergence_epsilon_thresholds():
 
     assert gate.clears_convergence_epsilon(below) is False
     assert gate.clears_convergence_epsilon(above) is True
+
+
+def test_tiny_same_sign_deltas_are_not_accepted_with_real_per_user_predictions(tmp_path, monkeypatch):
+    """Demonstrates the bug the seed-level bootstrap had: three matched
+    seeds with tiny, same-signed per-seed deltas that a pure per-seed
+    bootstrap can never see cross zero (any resample of same-signed
+    numbers stays same-signed), no matter how small they are or how
+    little real per-user signal backs them.
+
+    Both candidate and incumbent scores here are independent noise,
+    uncorrelated with the label — there is no real effect at all. The
+    three seeds below (offsets 17, 45, 30 into a fixed RNG stream) were
+    picked because, purely by chance, all three happen to land on the
+    positive side (deltas ~0.0027, ~0.0035, ~0.0040) — exactly the kind
+    of 1-in-8 fluke harness/gate.py's seed-level fallback comment
+    describes. With real per-user predictions available, the user-level
+    bootstrap must reveal this as noise and reject.
+    """
+    monkeypatch.setattr(cache, "_PREDS_DIR", tmp_path / "preds")
+
+    n_users = 150
+    rows_per_user = 4
+    n_rows = n_users * rows_per_user
+    offsets = {0: 17, 1: 45, 2: 30}
+
+    val_for_candidate = {}
+    val_for_incumbent = {}
+    for seed, offset in offsets.items():
+        rng = np.random.default_rng(2000 + offset)
+        user_ids = np.repeat(np.arange(n_users), rows_per_user)
+        labels = rng.integers(0, 2, size=n_rows)
+        incumbent_scores = rng.normal(size=n_rows)
+        candidate_scores = rng.normal(size=n_rows)  # independent of incumbent_scores: no real effect
+
+        cache.save_predictions("cand", seed, "val", user_ids, labels, candidate_scores)
+        cache.save_predictions("incu", seed, "val", user_ids, labels, incumbent_scores)
+
+        val_for_candidate[seed] = hmetrics.evaluate(user_ids, labels, candidate_scores)
+        val_for_incumbent[seed] = hmetrics.evaluate(user_ids, labels, incumbent_scores)
+
+    # Same tiny, same-signed deltas a pure seed-level bootstrap would
+    # always accept (assert the premise, so this test fails loudly if the
+    # chosen offsets ever stop producing it).
+    per_seed_deltas = [
+        val_for_candidate[s].primary - val_for_incumbent[s].primary for s in offsets
+    ]
+    assert all(d > 0 for d in per_seed_deltas)
+    assert all(d < 0.01 for d in per_seed_deltas)
+
+    backtest = {s: _metrics(0.6) for s in offsets}
+    candidate = CandidateResult(
+        config_id="cand", status=Status.OK, val=val_for_candidate, backtest=backtest,
+        val_pred_path="artifacts/preds/cand.npz",
+    )
+    incumbent = CandidateResult(
+        config_id="incu", status=Status.OK, val=val_for_incumbent, backtest=backtest,
+        val_pred_path="artifacts/preds/incu.npz",
+    )
+
+    verdict = gate.compare(candidate, incumbent)
+
+    assert verdict.accept is False
+    assert verdict.reason == "ci_includes_zero"
+    assert verdict.ci95[0] <= 0.0
+    assert "coarse_ci_seed_bootstrap" not in verdict.reason

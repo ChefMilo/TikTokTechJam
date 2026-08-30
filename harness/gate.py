@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 
 from contracts import CandidateResult, Metrics, Verdict
+from harness import cache, metrics
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _SEED_VARIANCE_PATH = REPO_ROOT / "artifacts" / "seed_variance.json"
@@ -84,33 +85,118 @@ def _backtest_delta(candidate: CandidateResult, incumbent: CandidateResult) -> f
     ) / len(matched)
 
 
-def _bootstrap_ci(per_seed_deltas: list[float]) -> tuple[float, float]:
-    """1000-resample, 95% percentile bootstrap CI on the mean paired delta.
+def _bootstrap_ci_seed_level(per_seed_deltas: list[float], rng: np.random.Generator) -> tuple[float, float]:
+    """FALLBACK ONLY (see _confirm) — bootstraps over the 3-5 per-seed
+    deltas themselves, used when per-user validation predictions are not
+    available for candidate and incumbent both.
 
-    GRANULARITY NOTE: the design calls for a "user-level" bootstrap —
-    resampling individual users' GAUC/nDCG contributions from raw
-    validation predictions, since those are already per-user aggregates.
-    contracts.CandidateResult.val only carries per-seed Metrics (already
-    aggregated across every user for that seed), not the underlying
-    per-user rows — a true user-level bootstrap would need to read
-    candidate.val_pred_path / incumbent.val_pred_path off disk, and no
-    schema for that file exists yet in this project. This instead
-    bootstraps over the matched PER-SEED paired deltas: the finest
-    granularity actually available in the contract today. With only 3-5
-    seeds this is a coarse CI, not a substitute for the real thing — when
-    val_pred_path gains a defined schema, this should be upgraded to
-    resample actual users instead of seeds.
-
-    Uses a fixed-seed RNG so compare() stays a pure function of its
-    inputs: the same two CandidateResults must always produce the same
-    Verdict, not one that flickers between calls.
+    This is NOT a coarse approximation of the intended test — it is
+    materially too permissive, and was a real correctness bug when it was
+    the only implementation. With exactly 3 matched seeds, if all three
+    per-seed deltas happen to share a sign, EVERY bootstrap resample drawn
+    from them also shares that sign, so the CI always excludes zero and
+    the gate accepts — regardless of how small the deltas are, because
+    resampling 3 same-signed numbers can never produce a resample mean of
+    the opposite sign. Under pure noise (no real effect), three
+    independent same-sign draws happen 1-in-8 of the time (2 * 0.5^3),
+    i.e. roughly a 12.5% false-positive rate. A fluke accepted here
+    becomes the new incumbent and poisons every later comparison against
+    it. _bootstrap_ci_user_level below is the real test and is preferred
+    whenever possible; this function only lets the gate still render a
+    verdict when per-user data isn't available, and callers must mark the
+    resulting reason with "coarse_ci_seed_bootstrap" so this weaker path
+    is never silently indistinguishable from the real one in the journal.
     """
-    rng = np.random.default_rng(0)
     deltas = np.asarray(per_seed_deltas, dtype=np.float64)
     resampled_means = np.empty(_BOOTSTRAP_RESAMPLES)
     for i in range(_BOOTSTRAP_RESAMPLES):
         resampled_means[i] = rng.choice(deltas, size=len(deltas), replace=True).mean()
     low, high = np.percentile(resampled_means, _BOOTSTRAP_PERCENTILES)
+    return float(low), float(high)
+
+
+def _rows_by_user_code(user_ids: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Returns (unique_users, row_indices_by_code): row_indices_by_code[c]
+    is the array of positions in `user_ids` belonging to unique_users[c].
+
+    Built with one argsort rather than a per-user scan (real validation
+    has ~24k users; an O(n_users * n_rows) scan would not finish).
+    """
+    unique_users, codes = np.unique(user_ids, return_inverse=True)
+    order = np.argsort(codes, kind="stable")
+    counts = np.bincount(codes[order], minlength=len(unique_users))
+    offsets = np.concatenate(([0], np.cumsum(counts)))
+    row_indices_by_code = [order[offsets[c]:offsets[c + 1]] for c in range(len(unique_users))]
+    return unique_users, row_indices_by_code
+
+
+def _bootstrap_ci_user_level(
+    candidate: CandidateResult,
+    incumbent: CandidateResult,
+    matched_seeds: list[int],
+    rng: np.random.Generator,
+) -> tuple[float, float]:
+    """The intended test: for each of 1000 resamples, draw the validation
+    user universe with replacement ONCE (shared across every matched seed
+    in that resample, so seed-to-seed correlation from resampling the
+    same users is preserved rather than resampled independently per
+    seed), rebuild each seed's resampled row set from the drawn users'
+    own rows, recompute candidate/incumbent primary via harness.metrics
+    on that resampled set (no retraining — this only reruns the vendor
+    scorer), and average the resulting per-seed delta over matched seeds.
+    Percentiles are taken over the 1000 resample-level means.
+
+    Validation is not vectorized against harness.metrics.evaluate's pure-
+    Python scorer, so this is O(1000 * seeds * rows) — fine for tests and
+    for the synthetic scale used here, but not optimized for the full
+    ~125k-row / ~24k-user validation set; a production run against the
+    real split would need a faster per-user aggregation than repeatedly
+    calling the vendor scorer.
+    """
+    per_seed_predictions: dict[int, tuple] = {}
+    for seed in matched_seeds:
+        c_users, c_labels, c_scores = cache.load_predictions(candidate.config_id, seed, "val")
+        i_users, i_labels, i_scores = cache.load_predictions(incumbent.config_id, seed, "val")
+        # cache.py stores labels as int8 (correct for the on-disk schema —
+        # each value is 0/1). But a bootstrap resample can draw the same
+        # user many times, stacking that user's rows into a block far
+        # bigger than any single real user has, and vendor evaluate()'s
+        # auc() sums labels and multiplies counts internally
+        # (npos * (npos + 1)) — done in whatever dtype it's handed, so a
+        # resampled per-user block large enough pushes that multiplication
+        # past int8's range and silently wraps instead of raising. Upcast
+        # once here, before any resampling, rather than downstream.
+        c_labels = c_labels.astype(np.int64)
+        i_labels = i_labels.astype(np.int64)
+        if not np.array_equal(c_users, i_users) or not np.array_equal(c_labels, i_labels):
+            raise ValueError(
+                f"seed {seed}: candidate and incumbent validation predictions "
+                "do not share the same rows (user_ids/labels differ) — cannot "
+                "pair them for a user-level bootstrap"
+            )
+        unique_users, row_indices_by_code = _rows_by_user_code(c_users)
+        per_seed_predictions[seed] = (c_users, c_labels, c_scores, i_scores, unique_users, row_indices_by_code)
+
+    # Validation rows/users are identical across seeds (only scores
+    # differ), so any matched seed's user set is the resampling universe.
+    reference_seed = matched_seeds[0]
+    n_users = len(per_seed_predictions[reference_seed][4])
+
+    resample_deltas = np.empty(_BOOTSTRAP_RESAMPLES)
+    for i in range(_BOOTSTRAP_RESAMPLES):
+        drawn_codes = rng.integers(0, n_users, size=n_users)
+        per_seed_deltas = []
+        for seed in matched_seeds:
+            c_users, c_labels, c_scores, i_scores, _, row_indices_by_code = per_seed_predictions[seed]
+            idx = np.concatenate([row_indices_by_code[c] for c in drawn_codes])
+            resampled_users = c_users[idx]
+            resampled_labels = c_labels[idx]
+            candidate_primary = metrics.evaluate(resampled_users, resampled_labels, c_scores[idx]).primary
+            incumbent_primary = metrics.evaluate(resampled_users, resampled_labels, i_scores[idx]).primary
+            per_seed_deltas.append(candidate_primary - incumbent_primary)
+        resample_deltas[i] = sum(per_seed_deltas) / len(per_seed_deltas)
+
+    low, high = np.percentile(resample_deltas, _BOOTSTRAP_PERCENTILES)
     return float(low), float(high)
 
 
@@ -173,7 +259,24 @@ def _confirm(candidate: CandidateResult, incumbent: CandidateResult) -> Verdict:
 
     per_seed_deltas = [candidate.val[s].primary - incumbent.val[s].primary for s in matched_seeds]
     delta = sum(per_seed_deltas) / len(per_seed_deltas)
-    ci95 = _bootstrap_ci(per_seed_deltas)
+
+    # Fixed seed so compare() stays a pure function of its inputs: the
+    # same two CandidateResults must always produce the same Verdict.
+    rng = np.random.default_rng(0)
+
+    # The real, intended test needs per-user validation predictions on
+    # BOTH sides. Never silently degrade: when they aren't available, we
+    # still render a verdict via the weaker seed-level bootstrap, but the
+    # reason string below is tagged so the journal can tell the two
+    # apart.
+    user_level_available = candidate.val_pred_path is not None and incumbent.val_pred_path is not None
+    if user_level_available:
+        ci95 = _bootstrap_ci_user_level(candidate, incumbent, matched_seeds, rng)
+        ci_method_note = None
+    else:
+        ci95 = _bootstrap_ci_seed_level(per_seed_deltas, rng)
+        ci_method_note = "coarse_ci_seed_bootstrap"
+
     backtest_delta = _backtest_delta(candidate, incumbent)
     n_seeds = len(matched_seeds)
 
@@ -191,6 +294,9 @@ def _confirm(candidate: CandidateResult, incumbent: CandidateResult) -> Verdict:
             f"paired CI excludes zero (n={n_seeds} seeds, delta={delta:+.5f}) "
             f"and backtest confirms (backtest_delta={backtest_delta:+.5f})"
         )
+
+    if ci_method_note:
+        reason = f"{reason}; {ci_method_note}"
 
     return Verdict(
         accept=accept,
