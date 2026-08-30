@@ -100,14 +100,20 @@ def load(split: str) -> list[tuple]:
         result = [row for row in rows if VAL_START <= row[0] <= VAL_END]
         upper_bound = VAL_END
 
+    # Explicit raises below, not assert — must survive python -O. These
+    # are the split invariant: under -O, `assert` vanishes entirely, and
+    # a slicing bug would silently leak hidden-test-window rows into
+    # training during an unattended overnight run instead of stopping it.
     max_date = max((row[0] for row in result), default=None)
-    assert max_date is None or max_date <= upper_bound, (
-        f"{split} split leaked rows past date {upper_bound}: max date found {max_date}"
-    )
-    assert len(result) == EXPECTED_ROWS[split], (
-        f"{split} split row count mismatch: got {len(result)}, "
-        f"expected {EXPECTED_ROWS[split]}"
-    )
+    if max_date is not None and max_date > upper_bound:
+        raise PermissionError(
+            f"{split} split leaked rows past date {upper_bound}: max date found {max_date}"
+        )
+    if len(result) != EXPECTED_ROWS[split]:
+        raise ValueError(
+            f"{split} split row count mismatch: got {len(result)}, "
+            f"expected {EXPECTED_ROWS[split]}"
+        )
     return result
 
 

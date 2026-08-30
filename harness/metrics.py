@@ -40,12 +40,12 @@ def evaluate(user_ids, labels, scores, k: int = 5) -> Metrics:
 
     The vendor dict also carries 'primary', 'users', and 'rows'; 'users'
     and 'rows' are dropped here since Metrics only carries named metric
-    values, and 'primary' is recomputed by Metrics itself. The assertion
+    values, and 'primary' is recomputed by Metrics itself. The check
     below is deliberately loud: our Metrics.primary is defined as an
     unweighted mean, which happens to match the vendor's
     (GAUC + nDCG@k) / 2 today — if either side's formula ever changes,
-    we want that divergence to fail a test immediately, not silently
-    skew every downstream ranking decision.
+    we want that divergence to fail immediately, not silently skew every
+    downstream ranking decision.
     """
     vendor_result = _vendor.evaluate(user_ids, labels, scores, k=k)
     metrics = Metrics(
@@ -54,8 +54,12 @@ def evaluate(user_ids, labels, scores, k: int = 5) -> Metrics:
             f"nDCG@{k}": vendor_result[f"nDCG@{k}"],
         }
     )
-    assert abs(metrics.primary - vendor_result["primary"]) < 1e-9, (
-        f"Metrics.primary ({metrics.primary}) diverged from vendor's "
-        f"primary ({vendor_result['primary']}) — unweighted-mean assumption broke"
-    )
+    # Explicit raise, not assert — must survive python -O. This is a
+    # correctness invariant, not a debugging aid; `assert` is stripped
+    # entirely under -O and would let a silent divergence through.
+    if abs(metrics.primary - vendor_result["primary"]) > 1e-9:
+        raise AssertionError(
+            f"Metrics.primary ({metrics.primary}) diverged from vendor's "
+            f"primary ({vendor_result['primary']}) — unweighted-mean assumption broke"
+        )
     return metrics

@@ -237,19 +237,43 @@ class CandidateResult:
     # requires a change to help on BOTH an internal forward split and
     # real validation. Making it optional would invite skipping it under
     # time pressure — exactly the moment overfitting to validation is
-    # most likely and most dangerous.
+    # most likely and most dangerous. An empty dict (`{}`) is still a
+    # legitimate value here — it's the "no backtest was run" case (screen
+    # stage, or a candidate that failed before backtesting), kept
+    # distinguishable from "ran and produced per-seed metrics" while the
+    # field itself stays required so that state can't be quietly skipped
+    # by passing None instead. This mirrors Verdict.backtest_delta below,
+    # which is None for exactly the same reason at the gate's output.
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Verdict:
     """Returned by the noise gate (harness.gate), consumed by the
     controller to decide accept/reject.
+
+    CONTRACT AMENDMENT (post W2 review): added `n_seeds`, and loosened
+    `backtest_delta` to Optional. kw_only=True because backtest_delta now
+    has a default while `reason` after it doesn't — same rationale as
+    CandidateResult above for sidestepping dataclass field-ordering rules
+    rather than reordering fields away from their conceptual grouping.
     """
 
     accept: bool
     delta: float
     ci95: tuple[float, float]
-    backtest_delta: float
+    # A 1-seed screen and a 5-seed confirm are otherwise indistinguishable
+    # downstream from delta/ci95 alone. That distinction matters because
+    # per-seed noise (sigma ~0.0008) sits close to the acceptance
+    # threshold (0.002) — the controller and the journal both need to
+    # know how much evidence backed a given verdict, not just what the
+    # verdict was.
+    n_seeds: int
+    # None means "no backtest was run" (screen stage, or a candidate that
+    # failed before backtesting ever happened) — distinct from 0.0, which
+    # means the backtest ran and showed no change. Collapsing those two
+    # into 0.0 would make an untested candidate indistinguishable from a
+    # confirmed-neutral one.
+    backtest_delta: Optional[float] = None
     reason: str
 
 
