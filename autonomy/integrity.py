@@ -56,6 +56,7 @@ from typing import Any, Optional
 
 __all__ = [
     "DEFAULT_SOURCE_DIRS",
+    "MIN_CANDIDATES_FOR_VERIFIED",
     "UNKNOWN",
     "CheckedExecutor",
     "IntegrityMetadata",
@@ -92,6 +93,25 @@ UNKNOWN = "unknown"
 An honest "unknown" is worth more than a fabricated hash: it tells a
 reviewer the provenance claim is weaker for this run, rather than
 offering a value that looks authoritative and is not.
+"""
+
+MIN_CANDIDATES_FOR_VERIFIED = 3
+"""How many candidates a run must have integrity-checked before it may
+call itself verified.
+
+WHY A FLOOR EXISTS AT ALL. Without one, the cheapest way to a green badge
+is the shortest possible run: evaluate nothing, check the source twice at
+the endpoints, and report "verified, fingerprint stable". That is true and
+worthless — nothing happened between the two checks, so stability across
+them says nothing about whether an agent ran unattended. The badge is
+supposed to mean "this run did real work and stayed clean throughout",
+and the only part of that a machine can enforce is that there WAS work.
+
+Three is deliberately modest — the baseline plus two search candidates,
+reachable at the default --max-nodes-per-stage of 2. It is a floor
+against the degenerate case, not a claim about what makes a good run.
+Configurable per-run so a deliberately short diagnostic run can still be
+honest about what it is.
 """
 
 _GIT_TIMEOUT_S = 10.0
@@ -439,14 +459,27 @@ class IntegrityMonitor:
         dirs: Iterable[str] = DEFAULT_SOURCE_DIRS,
         repo_root: Optional[Path] = None,
         who: str = "scripts/run_controller.py",
+        min_candidates: int = MIN_CANDIDATES_FOR_VERIFIED,
     ) -> None:
         self.launch = dict(launch)
         self._on_intervention = on_intervention
         self._dirs = tuple(dirs)
         self._repo_root = REPO_ROOT if repo_root is None else Path(repo_root)
         self._who = who
+        self._min_candidates = min_candidates
 
         self.checks_performed = 0
+        self.candidates_checked = 0
+        """Checks made at a NODE BOUNDARY specifically — one per candidate
+        the executor evaluated.
+
+        Tracked apart from `checks_performed` because they answer different
+        questions. The total says how much verification happened; this says
+        how much of the RUN was covered by it. A run whose executor was
+        never wrapped in CheckedExecutor still accumulates the two endpoint
+        checks and would otherwise look verified while nothing in the
+        middle was ever looked at.
+        """
         self.interventions: list[dict[str, Any]] = []
         self.drifted = False
         self.current_code_hash: str = str(self.launch.get("code_hash", UNKNOWN))
@@ -518,12 +551,50 @@ class IntegrityMonitor:
         killed one (contracts.EventKind.RUN_END's own docstring).
 
         `verified` is the one-line claim, and it is deliberately
-        conservative: it is only true when the tree was known-clean at
-        launch, the fingerprint never moved, and no intervention was
-        recorded. A run launched from a dirty tree still produces a
-        complete record — it simply does not get to claim this.
+        conservative — FOUR conditions, all of which must hold:
+
+          1. the working tree was KNOWN clean at launch (not dirty, and
+             not unknown);
+          2. the source fingerprint never moved;
+          3. nothing was counted as a manual intervention;
+          4. at least `min_candidates` candidates were checked at a node
+             boundary — see MIN_CANDIDATES_FOR_VERIFIED for why a run that
+             did no work must not get a green badge for it.
+
+        A run failing any of them still produces a complete record; it
+        simply does not get to claim this. `unverified_because` names the
+        conditions that failed, so a reader is never left guessing which
+        one — an unexplained false is barely more useful than no field.
         """
         clean_launch = self.launch.get("dirty") is False
+        enough_work = self.candidates_checked >= self._min_candidates
+
+        unverified_because: list[str] = []
+        if not clean_launch:
+            tree = "unknown" if self.launch.get("dirty") is None else "dirty"
+            unverified_because.append(
+                f"the working tree was {tree} at launch, so this run's "
+                "provenance cannot be pinned to a committed state"
+            )
+        if self.drifted:
+            unverified_because.append(
+                "the source fingerprint changed during the run, so later "
+                "nodes did not run the code earlier nodes ran"
+            )
+        if self.interventions:
+            kinds = ", ".join(sorted({e["type"] for e in self.interventions}))
+            unverified_because.append(
+                f"{len(self.interventions)} manual intervention(s) were "
+                f"recorded ({kinds})"
+            )
+        if not enough_work:
+            unverified_because.append(
+                f"only {self.candidates_checked} candidate(s) were "
+                f"integrity-checked, below the floor of {self._min_candidates}; "
+                "a run that evaluated (almost) nothing cannot demonstrate "
+                "that it stayed clean while working"
+            )
+
         return {
             "commit": self.launch.get("commit", UNKNOWN),
             "tree_clean_at_launch": clean_launch,
@@ -532,16 +603,23 @@ class IntegrityMonitor:
             "final_code_hash": self.current_code_hash,
             "code_fingerprint_stable": not self.drifted,
             "checks_performed": self.checks_performed,
+            "candidates_checked": self.candidates_checked,
+            "min_candidates_for_verified": self._min_candidates,
             "source_dirs": list(self._dirs),
             "manual_interventions": len(self.interventions),
             "intervention_types": [entry["type"] for entry in self.interventions],
-            "verified": bool(
-                clean_launch and not self.drifted and not self.interventions
-            ),
+            "verified": not unverified_because,
+            "unverified_because": unverified_because,
         }
 
     def check_at_node_boundary(self, config_id: str) -> None:
-        """Convenience label for CheckedExecutor's call site."""
+        """One candidate's worth of verification. CheckedExecutor's call site.
+
+        Counted separately from an endpoint check because this is the one
+        that proves the MIDDLE of the run was watched — see
+        `candidates_checked`.
+        """
+        self.candidates_checked += 1
         self.check(label=f"node boundary before {config_id}")
 
     def one_line(self) -> str:
@@ -557,7 +635,8 @@ class IntegrityMonitor:
         return (
             f"commit={str(s['commit'])[:12]}, tree at launch={tree}, "
             f"code fingerprint {'stable' if s['code_fingerprint_stable'] else 'CHANGED'} "
-            f"across {s['checks_performed']} check(s), "
+            f"across {s['checks_performed']} check(s) covering "
+            f"{s['candidates_checked']} candidate(s), "
             f"manual interventions={s['manual_interventions']}"
         )
 

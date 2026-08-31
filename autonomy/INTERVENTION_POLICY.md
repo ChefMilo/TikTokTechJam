@@ -71,9 +71,41 @@ journal's own `RUN_START` and `RUN_END` payloads:
   the run. Once at each end is a weak claim; once per node boundary
   across four hours is a strong one, and the number is what tells them
   apart.
-- `verified` — true only when the tree was known-clean at launch, the
-  fingerprint never moved, and nothing was counted. Conservative on
-  purpose.
+- `verified` — the badge. Four conditions, all required (see below).
+
+## The `verified` rule
+
+`VERIFIED AUTONOMOUS` is true only when **all four** hold:
+
+1. **The working tree was known clean at launch.** Not dirty, and not
+   unknown — a run that cannot say what code it ran cannot claim to have
+   run it unattended. `--require-clean` turns this into a refusal to
+   start rather than a badge withheld afterwards, and the real artifact
+   run passes it.
+2. **The source fingerprint never moved.** Later nodes ran the same code
+   as earlier ones.
+3. **Nothing was counted as a manual intervention.**
+4. **At least `min_candidates` candidates were integrity-checked at a
+   node boundary** (default 3, `--min-verified-candidates`).
+
+Condition 4 was added after the first version of this document, and it is
+worth saying why. Without it, the cheapest route to a green badge is the
+*shortest possible run*: evaluate nothing, check the source twice at the
+two endpoints, and report "verified, fingerprint stable". Every word of
+that is true and none of it is worth anything — nothing happened between
+the two checks, so their agreeing says nothing about whether an agent
+worked unattended. The floor makes the badge mean "this run did real work
+and stayed clean throughout" rather than "this run was too short to go
+wrong".
+
+The count is of **node-boundary** checks specifically, not of checks in
+general. A run whose executor was never wrapped in `CheckedExecutor`
+still accumulates the two endpoint checks and would otherwise look
+verified while the entire middle went unobserved.
+
+When the badge is false, `unverified_because` names every condition that
+failed, and the rendered `autonomy.md` prints them. An unexplained
+"false" is barely more useful than no field at all.
 
 A reviewer can attack any of these. That is the point: "checked 7 times,
 stable, clean at launch, commit 62a61f8" is a falsifiable claim, and "0"

@@ -427,7 +427,11 @@ def test_a_stable_run_records_no_interventions_and_counts_its_checks(source_tree
     assert summary["checks_performed"] == 3
     assert summary["code_fingerprint_stable"] is True
     assert summary["manual_interventions"] == 0
-    assert summary["verified"] is True
+    # Stable and clean, but these were endpoint-style checks with no
+    # candidate behind them, so the run has not earned the badge — see
+    # test_endpoint_checks_alone_do_not_earn_the_badge below.
+    assert summary["candidates_checked"] == 0
+    assert summary["verified"] is False
 
 
 def test_a_mid_run_edit_is_recorded_as_an_intervention(source_tree):

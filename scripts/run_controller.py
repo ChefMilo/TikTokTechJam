@@ -146,12 +146,15 @@ from autonomy.adapters import (  # noqa: E402
     SlotScriptedGenerator,
 )
 from autonomy.integrity import (  # noqa: E402
+    MIN_CANDIDATES_FOR_VERIFIED,
+    UNKNOWN,
     CheckedExecutor,
     IntegrityMetadata,
     IntegrityMonitor,
     classify_relaunch,
     launch_fingerprint,
 )
+from autonomy.render import render_autonomy  # noqa: E402
 
 DEFAULT_SEEDS: tuple[int, ...] = (0, 1, 2)
 """Three seeds so harness.gate takes its CONFIRM path.
@@ -313,6 +316,27 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-clean",
+        action="store_true",
+        help=(
+            "refuse to start unless git reports a clean working tree and a "
+            "known commit. OFF by default so development runs work; the real "
+            "artifact run should pass it, because a run that cannot say what "
+            "code it ran cannot claim to have run it unattended"
+        ),
+    )
+    parser.add_argument(
+        "--min-verified-candidates",
+        type=int,
+        default=MIN_CANDIDATES_FOR_VERIFIED,
+        help=(
+            "how many candidates must be integrity-checked before the run may "
+            f"call itself VERIFIED AUTONOMOUS (default: "
+            f"{MIN_CANDIDATES_FOR_VERIFIED}). A floor against a zero-work run "
+            "claiming a clean badge for doing nothing"
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -381,6 +405,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"    {relaunch.reason}")
     print()
 
+    # --- --require-clean: refuse BEFORE touching the journal -----------
+    #
+    # Checked here, before the Journal is even constructed, so a refused
+    # launch leaves no trace. Appending a RUN_START and then bailing would
+    # put an interrupted run in the file, which the next launch would
+    # correctly classify as a manual restart — manufacturing an
+    # intervention out of a run that never started.
+    if args.require_clean and launch["dirty"] is not False:
+        print("REFUSING TO START (--require-clean)")
+        if launch["dirty"] is None:
+            print("  git could not determine the working tree state, so this")
+            print("  run's provenance could not be pinned to a commit.")
+        else:
+            print(f"  the working tree has {len(launch['dirty_files'])} uncommitted change(s):")
+            for entry in launch["dirty_files"]:
+                print(f"    {entry}")
+        if launch["commit"] == UNKNOWN:
+            print("  the commit could not be determined either.")
+        print()
+        print("  An artifact run must start from a committed, clean tree — a")
+        print("  run that cannot say what code it ran cannot claim to have run")
+        print("  it unattended. Commit or stash, then relaunch. Drop")
+        print("  --require-clean for a development run that does not need the")
+        print("  provenance claim.")
+        return 3
+
     journal = Journal(str(journal_path), run_id=run_id)
     monitor = IntegrityMonitor(
         launch=launch,
@@ -389,6 +439,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # executor/report.py counts — so its number and ours cannot
         # disagree. See autonomy/INTERVENTION_POLICY.md.
         on_intervention=journal.log_intervention,
+        min_candidates=args.min_verified_candidates,
     )
     # Logged BEFORE the Controller's RUN_START, so the journal reads in the
     # order the events happened: a human restarted this, then the run
@@ -454,14 +505,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"    {monitor.one_line()}")
     print(f"    code fingerprint checks = {summary['checks_performed']}")
     print(f"    fingerprint stable      = {summary['code_fingerprint_stable']}")
+    print(f"    candidates checked      = {summary['candidates_checked']} "
+          f"(floor {summary['min_candidates_for_verified']})")
     print(f"    manual interventions    = {summary['manual_interventions']}")
     if summary["intervention_types"]:
         for entry in monitor.interventions:
             print(f"      - {entry['type']}: {entry['reason']}")
-    print(
-        f"    VERIFIED AUTONOMOUS     = {summary['verified']}"
-        f"{'' if summary['verified'] else '  (see autonomy/INTERVENTION_POLICY.md for what this requires)'}"
-    )
+    print(f"    VERIFIED AUTONOMOUS     = {summary['verified']}")
+    for reason in summary["unverified_because"]:
+        print(f"      not verified: {reason}")
     # THE CROSS-CHECK. The number executor/report.py will render is the
     # count of INTERVENTION events in the journal; the number printed above
     # is the monitor's own tally. If those ever disagree, two artifacts
@@ -483,6 +535,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("    the rendered report and this summary would disagree; do not")
         print("    publish either number until this is explained.")
         return 2
+
+    # --- the autonomy section, ALWAYS written --------------------------
+    #
+    # Not gated behind --report. That flag exists because
+    # executor/report.py cannot render a Controller journal yet; this
+    # renderer reads the journal directly and shares none of that
+    # machinery, so gating it behind an unrelated flag would make the
+    # autonomy evidence hostage to a metric-rendering bug in someone
+    # else's file. The two documents defend different claims and should
+    # fail independently.
+    render_autonomy(str(journal_path), str(report_dir), run_id=run_id)
+    print()
+    print(f"  autonomy section     = {report_dir / 'autonomy.md'}")
 
     if args.report:
         # Deliberately unguarded. If this raises, the run itself already
