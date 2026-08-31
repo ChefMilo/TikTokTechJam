@@ -22,6 +22,45 @@ No prompts, no interactive input, no hardcoded wall-clock: the elapsed
 time reported to executor.report.render is measured here.
 
 
+RUN INTEGRITY — WHAT MAKES "0 INTERVENTIONS" MEAN ANYTHING
+-----------------------------------------------------------
+A count of zero proves nothing when the event is simply never emitted,
+which is what the repo produced before this. So the run records what it
+CHECKED, positively, in its own journal:
+
+  AT LAUNCH, before anything is appended, autonomy.integrity captures the
+  commit, whether the working tree was clean, and a sha256 over the source
+  that actually runs (executor/, harness/, controller/, methods/,
+  autonomy/). It also reads whatever is already in the target journal and
+  classifies why this process is starting — fresh, an autonomous resume,
+  or a manual restart.
+
+  DURING THE RUN, CheckedExecutor re-hashes that source before every
+  candidate. A node boundary is the natural checkpoint and costs ~5ms
+  against evaluations measured in hundreds of seconds. Drift is logged
+  once as INTERVENTION(type="code_changed_midrun").
+
+  AT BOTH ENDS, the Controller reads its `run_metadata` to build RUN_START
+  and RUN_END, and that read is itself an integrity check (see
+  IntegrityMetadata). RUN_END therefore carries a summary that is true at
+  RUN_END: commit, tree state at launch, how many checks ran, whether the
+  fingerprint held, and how many interventions were counted.
+
+Only genuine manual touches become EventKind.INTERVENTION events, so this
+script's tally and executor/report.py's existing counter are the same
+number by construction — the run cross-checks them before exiting and
+returns 2 if they disagree. An autonomous resume is recorded in RUN_START
+metadata and deliberately counted as nothing.
+
+autonomy/INTERVENTION_POLICY.md is the reviewable definition of what
+counts. Read that before trusting the number.
+
+`--resume` says this launch is an autonomous relaunch. It does NOT resume
+the Controller's state — the run starts fresh at Stage.INIT — and the
+policy document is explicit that calling it a resume of the RUN would
+overclaim.
+
+
 WHY THE DEFAULT POLICY ORDER OMITS `features`
 ---------------------------------------------
 The ten scripted moves target five slots — model (4), objective (2),
@@ -87,7 +126,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -105,6 +144,13 @@ from autonomy.adapters import (  # noqa: E402
     MovesRealizer,
     RunCandidateExecutor,
     SlotScriptedGenerator,
+)
+from autonomy.integrity import (  # noqa: E402
+    CheckedExecutor,
+    IntegrityMetadata,
+    IntegrityMonitor,
+    classify_relaunch,
+    launch_fingerprint,
 )
 
 DEFAULT_SEEDS: tuple[int, ...] = (0, 1, 2)
@@ -164,6 +210,8 @@ def build_controller(
     policy_order: Sequence[SlotName],
     run_id: str,
     failures_before_block: int = 2,
+    monitor: Optional[IntegrityMonitor] = None,
+    run_metadata: Optional[Mapping[str, object]] = None,
 ) -> tuple[Controller, RunCandidateExecutor]:
     """Wire the real Controller. Returns it and the executor adapter,
     which carries the delegation log the run summary prints.
@@ -171,14 +219,24 @@ def build_controller(
     Split out from main() so the wiring is testable without launching a
     multi-hour training run — the same discipline manual/run.py applies
     to its own argument parsing.
+
+    `monitor` wraps the executor in CheckedExecutor so the source is
+    re-verified before every candidate; `run_metadata` reaches the
+    Controller's RUN_START and RUN_END payloads. Both default to None so
+    the Controller can still be built without the integrity machinery,
+    which is what the adapter-level tests do.
     """
     executor = RunCandidateExecutor(
         # No journal: the Controller is the sole journaller for a
         # Controller-driven run. See RunCandidateExecutor's docstring.
         journal=None,
     )
+    # The Controller sees the wrapper; the caller keeps the adapter, whose
+    # `calls` log the run summary prints. CheckedExecutor delegates
+    # unknown attributes, so either reference reaches the same state.
+    port = executor if monitor is None else CheckedExecutor(executor, monitor)
     controller = Controller(
-        executor=executor,
+        executor=port,
         # The module object itself. ports.GatePort's docstring spells out
         # why no adapter is needed, and tests/test_false_positive_rate.py
         # already wires the real gate exactly this way.
@@ -192,6 +250,7 @@ def build_controller(
         max_nodes_per_stage=max_nodes_per_stage,
         failures_before_block=failures_before_block,
         run_id=run_id,
+        run_metadata=run_metadata,
     )
     return controller, executor
 
@@ -254,6 +313,18 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "this launch is an autonomous relaunch of an interrupted run at "
+            "--journal. Combined with an unchanged source fingerprint, the "
+            "relaunch is recorded as autonomous and NOT counted as a manual "
+            "intervention. Note this does NOT resume the Controller's state: "
+            "the run starts fresh at Stage.INIT. See "
+            "autonomy/INTERVENTION_POLICY.md"
+        ),
+    )
+    parser.add_argument(
         "--report",
         action="store_true",
         help=(
@@ -284,7 +355,48 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  report_dir           = {report_dir}")
     print()
 
+    # --- integrity: establish provenance BEFORE anything else runs -----
+    #
+    # Order matters. The relaunch classification is read off whatever is
+    # already in the journal, so it must be computed before this run
+    # appends anything to it.
+    launch = launch_fingerprint()
+    prior_events = Journal.replay(str(journal_path))
+    relaunch = classify_relaunch(
+        prior_events,
+        code_hash=launch["code_hash"],
+        resume_requested=args.resume,
+    )
+
+    tree_state = {True: "DIRTY", False: "clean", None: "unknown"}[launch["dirty"]]
+    if launch["dirty"]:
+        tree_state += f" ({len(launch['dirty_files'])} uncommitted file(s))"
+    counted = " (COUNTS as a manual intervention)" if relaunch.counts_as_intervention else ""
+
+    print("integrity")
+    print(f"  commit               = {launch['commit']}")
+    print(f"  tree at launch       = {tree_state}")
+    print(f"  code_hash            = {launch['code_hash'][:16]}...")
+    print(f"  relaunch             = {relaunch.kind}{counted}")
+    print(f"    {relaunch.reason}")
+    print()
+
     journal = Journal(str(journal_path), run_id=run_id)
+    monitor = IntegrityMonitor(
+        launch=launch,
+        # The journal's own helper. Every call becomes an
+        # EventKind.INTERVENTION event, which is exactly what
+        # executor/report.py counts — so its number and ours cannot
+        # disagree. See autonomy/INTERVENTION_POLICY.md.
+        on_intervention=journal.log_intervention,
+    )
+    # Logged BEFORE the Controller's RUN_START, so the journal reads in the
+    # order the events happened: a human restarted this, then the run
+    # began. An autonomous resume records nothing here — it is visible in
+    # RUN_START metadata instead, and counting it would inflate the very
+    # number it is supposed to leave alone.
+    monitor.record_relaunch(relaunch)
+
     controller, executor = build_controller(
         journal=journal,
         seeds=seeds,
@@ -292,6 +404,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         policy_order=policy_order,
         run_id=run_id,
         failures_before_block=args.failures_before_block,
+        monitor=monitor,
+        run_metadata=IntegrityMetadata(monitor, relaunch=relaunch.as_payload()),
     )
 
     start = time.perf_counter()
@@ -326,6 +440,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"  terminal event       = {terminal.value if terminal else None}"
         f"{'  (clean finish)' if terminal is EventKind.RUN_END else '  (NOT run_end — the run did not finish through its normal path)'}"
     )
+
+    # --- integrity: the positive record -------------------------------
+    #
+    # Printed from the same summary that RUN_END carries, so the console
+    # and the journal cannot tell different stories. Note the summary is
+    # NOT recomputed here: the authoritative one was built when the
+    # Controller read run_metadata to emit RUN_END, which is also when the
+    # final check ran. See IntegrityMetadata.
+    summary = monitor.summary()
+    print()
+    print("  integrity summary")
+    print(f"    {monitor.one_line()}")
+    print(f"    code fingerprint checks = {summary['checks_performed']}")
+    print(f"    fingerprint stable      = {summary['code_fingerprint_stable']}")
+    print(f"    manual interventions    = {summary['manual_interventions']}")
+    if summary["intervention_types"]:
+        for entry in monitor.interventions:
+            print(f"      - {entry['type']}: {entry['reason']}")
+    print(
+        f"    VERIFIED AUTONOMOUS     = {summary['verified']}"
+        f"{'' if summary['verified'] else '  (see autonomy/INTERVENTION_POLICY.md for what this requires)'}"
+    )
+    # THE CROSS-CHECK. The number executor/report.py will render is the
+    # count of INTERVENTION events in the journal; the number printed above
+    # is the monitor's own tally. If those ever disagree, two artifacts
+    # make different claims about the same run and neither can be trusted.
+    #
+    # An explicit check rather than `assert`, for the reason harness/data.py
+    # and harness/metrics.py give for theirs: `python -O` strips asserts,
+    # and this is a correctness invariant about the headline number, not a
+    # debugging aid. Reported rather than raised — the run itself finished
+    # and its journal is durable on disk, so tearing down here would
+    # destroy nothing but would hide that the run completed. The exit code
+    # carries the failure instead.
+    logged = [e for e in this_run if e.kind is EventKind.INTERVENTION]
+    if len(logged) != summary["manual_interventions"]:
+        print()
+        print("  *** INTEGRITY ACCOUNTING MISMATCH ***")
+        print(f"    journal holds {len(logged)} INTERVENTION event(s)")
+        print(f"    monitor counted {summary['manual_interventions']}")
+        print("    the rendered report and this summary would disagree; do not")
+        print("    publish either number until this is explained.")
+        return 2
 
     if args.report:
         # Deliberately unguarded. If this raises, the run itself already

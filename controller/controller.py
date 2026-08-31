@@ -41,7 +41,7 @@ to timestamp an event.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -163,6 +163,7 @@ class Controller:
         max_nodes_per_stage: int = 3,
         failures_before_block: int = 2,
         run_id: Optional[str] = None,
+        run_metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self._executor = executor
         self._gate = gate
@@ -217,6 +218,30 @@ class Controller:
         # the generated default is deliberately unique per run so two runs
         # cannot be confused for one another in a shared log.
         self._run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
+        # Caller-supplied context about the run itself, merged into the two
+        # bookend events under the "run_metadata" key. None by default and
+        # omitted entirely when None, so a caller that passes nothing gets
+        # byte-identical payloads to before this parameter existed.
+        #
+        # WHY THE CONTROLLER CARRIES THIS RATHER THAN THE LAUNCHER
+        # APPENDING ITS OWN RECORD. Launch provenance belongs in RUN_START
+        # and end-of-run evidence belongs in RUN_END, and those two events
+        # are emitted here. A launcher cannot append its own terminal
+        # record instead: nothing may follow RUN_END, or a replay can no
+        # longer tell "the log ends because the run finished" from "the log
+        # ends because the process died" (see EventKind.RUN_END). Nor can
+        # it emit a second RUN_START without making the log ambiguous about
+        # where the run began.
+        #
+        # READ AT EMIT TIME, NOT COPIED. A caller may keep updating the
+        # mapping while the run proceeds, so that RUN_END carries what was
+        # true at the end rather than what was true at construction. That
+        # is deliberate and is what lets scripts/run_controller.py record
+        # how many integrity checks a run actually performed.
+        #
+        # Determinism is unaffected: the Controller still emits an
+        # identical event sequence for identical inputs. This is an input.
+        self._run_metadata = run_metadata
 
     # -- public API ----------------------------------------------------
 
@@ -228,11 +253,13 @@ class Controller:
         self._emit(
             state,
             EventKind.RUN_START,
-            {
-                "seeds": list(self._seeds),
-                "max_nodes_per_stage": self._max_nodes_per_stage,
-                "stage_order": [s.value for s in STAGE_ORDER],
-            },
+            self._with_run_metadata(
+                {
+                    "seeds": list(self._seeds),
+                    "max_nodes_per_stage": self._max_nodes_per_stage,
+                    "stage_order": [s.value for s in STAGE_ORDER],
+                }
+            ),
         )
 
         stop_reason: Optional[str] = None
@@ -736,15 +763,29 @@ class Controller:
         self._emit(
             state,
             EventKind.RUN_END,
-            {
-                "stop_reason": stop_reason or "stages_complete",
-                "iteration": state.iteration,
-                "node": state.node,
-            },
+            self._with_run_metadata(
+                {
+                    "stop_reason": stop_reason or "stages_complete",
+                    "iteration": state.iteration,
+                    "node": state.node,
+                }
+            ),
         )
         return state
 
     # -- helpers -------------------------------------------------------
+
+    def _with_run_metadata(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """`payload` plus the caller's run metadata, if any was supplied.
+
+        Nested under one key rather than merged flat, so caller-supplied
+        context can never shadow a field the Controller owns — a metadata
+        dict containing "stop_reason" must not be able to rewrite the
+        run's actual stop reason.
+        """
+        if self._run_metadata is None:
+            return payload
+        return {**payload, "run_metadata": dict(self._run_metadata)}
 
     def _realize(
         self, state: RunState, payload: HypothesisPayload

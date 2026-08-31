@@ -18,13 +18,33 @@ from autonomy.adapters import (
     SlotScriptedGenerator,
     resolve_fragment,
 )
+from autonomy.integrity import (
+    DEFAULT_SOURCE_DIRS,
+    CheckedExecutor,
+    IntegrityMetadata,
+    IntegrityMonitor,
+    RelaunchClassification,
+    classify_relaunch,
+    code_fingerprint,
+    git_state,
+    launch_fingerprint,
+)
 
 __all__ = [
+    "DEFAULT_SOURCE_DIRS",
+    "CheckedExecutor",
     "DurableJournal",
     "ExecutorAdapterError",
+    "IntegrityMetadata",
+    "IntegrityMonitor",
     "MovesRealizer",
+    "RelaunchClassification",
     "RunCandidateExecutor",
     "ScriptedMoves",
     "SlotScriptedGenerator",
+    "classify_relaunch",
+    "code_fingerprint",
+    "git_state",
+    "launch_fingerprint",
     "resolve_fragment",
 ]
