@@ -41,7 +41,7 @@ def _non_comment_code(path: Path) -> str:
     raise, not assert" comments).
     """
     kept_lines = []
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip().startswith("#"):
             continue
         kept_lines.append(line.split("#", 1)[0])

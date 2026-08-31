@@ -63,7 +63,7 @@ def split() -> tuple[list[tuple], list[tuple]]:
         print(
             f"harness.backtest.split(): fit={_ROW_COUNTS['fit']:,} rows "
             f"(date <= {BT_FIT_END}), score={_ROW_COUNTS['score']:,} rows "
-            f"({BT_SCORE_START} <= date <= {BT_SCORE_END}) — recorded as reference"
+            f"({BT_SCORE_START} <= date <= {BT_SCORE_END}) - recorded as reference"
         )
 
     return fit_rows, score_rows
