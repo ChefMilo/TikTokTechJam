@@ -33,6 +33,8 @@ def _build_synthetic_journal(path: str) -> None:
         target_slot="model",
         fragment_impl="fm",
         fragment_params={"k": 32, "lr": 0.001},
+        gpu_seconds=12.5,
+        tokens=340,
         node=1,
     )
     verdict = Verdict(
@@ -78,7 +80,12 @@ def test_results_md_reports_best_metrics_and_deltas(tmp_path):
     content = (out_dir / "results.md").read_text(encoding="utf-8")
 
     assert "Validation-best GAUC" in content
-    assert "Total tokens | 0" in content
+    # Computed from the journal's EVAL_RESULT payload (gpu_seconds=12.5,
+    # tokens=340 in _build_synthetic_journal above), not a hardcoded
+    # literal — a stale "0" here would mean the table stopped reading
+    # real cost data and silently went back to reporting a fixed string.
+    assert "Total GPU-seconds | 12.5" in content
+    assert "Total tokens | 340" in content
     assert "Iterations used | 1 / 50" in content
 
 
@@ -161,6 +168,26 @@ def test_iterations_md_renders_errors_and_recovery_table(tmp_path):
     assert "contract" in content
     assert "skip_unimplemented" in content
     assert "the run continued past every one" in content
+
+
+def test_contract_error_recovery_reads_as_handled_not_a_raw_crash_dump(tmp_path):
+    """A CONTRACT/NotImplementedError candidate (unimplemented slot impl,
+    or bpr composed with non-default weighting) is the taxonomy working as
+    designed, not an unexplained crash — the RECOVERY line must read as a
+    clean sentence naming the policy that was applied, not a dumped
+    payload dict a reader has to parse to understand what happened.
+    """
+    journal_path = tmp_path / "journal.jsonl"
+    _build_journal_with_one_failure(str(journal_path))
+    out_dir = tmp_path / "report"
+
+    render(str(journal_path), output_dir=str(out_dir))
+
+    content = (out_dir / "iterations.md").read_text(encoding="utf-8")
+    assert "**Recovery** (policy=`skip_unimplemented`): continuing to next candidate" in content
+    # The raw dict repr must NOT appear — that was the crash-dump reading.
+    assert "{'policy':" not in content
+    assert "{'message':" not in content
 
 
 def test_results_md_summarizes_failures(tmp_path):

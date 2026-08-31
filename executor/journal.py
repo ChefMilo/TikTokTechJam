@@ -206,6 +206,8 @@ class Journal:
         target_slot: Optional[str] = None,
         fragment_impl: Optional[str] = None,
         fragment_params: Optional[dict[str, Any]] = None,
+        gpu_seconds: float = 0.0,
+        tokens: int = 0,
         iteration: Optional[int] = None,
         node: Optional[int] = None,
     ) -> JournalEvent:
@@ -214,6 +216,13 @@ class Journal:
         executor.report.render uses them to show "the config diff versus
         its parent" per node. Omit them and the report just shows the
         metrics without a diff.
+
+        `gpu_seconds` and `tokens` (tokens_in + tokens_out, summed by the
+        caller — see executor.run.run_candidate) mirror the cost fields
+        contracts.CandidateResult already carries. Defaulting both to 0
+        matches CandidateResult's own defaults: a caller with nothing to
+        report (every candidate in this pipeline today — no GPU, no LLM)
+        gets an honest zero, not a missing key a reader has to guess about.
         """
         payload: dict[str, Any] = {
             "config_id": config_id,
@@ -222,6 +231,8 @@ class Journal:
                 for seed, metrics in per_seed_metrics.items()
             },
             "wall_seconds": wall_seconds,
+            "gpu_seconds": gpu_seconds,
+            "tokens": tokens,
             "target_slot": target_slot,
             "fragment_impl": fragment_impl,
             "fragment_params": fragment_params,

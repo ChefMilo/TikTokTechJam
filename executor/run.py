@@ -97,19 +97,11 @@ def run_candidate(
             cache.save_predictions(config_id, seed, "backtest", bt_user_ids, bt_labels, bt_scores)
 
         wall_seconds = time.perf_counter() - start
-        if journal is not None:
-            journal.log_eval_result(
-                config_id,
-                val_metrics,
-                wall_seconds,
-                backtest_per_seed_metrics=backtest_metrics,
-                target_slot=target_slot,
-                fragment_impl=fragment.impl,
-                fragment_params=fragment.params,
-                node=node,
-            )
-
-        return CandidateResult(
+        # No GPU, no LLM anywhere in this pipeline today — both are
+        # genuinely 0.0/0, not unknown. Read from a CandidateResult built
+        # below rather than hand-summed here, so the journal and the
+        # returned object can never disagree about what this candidate cost.
+        result = CandidateResult(
             config_id=config_id,
             status=Status.OK,
             val=val_metrics,
@@ -122,6 +114,21 @@ def run_candidate(
             val_pred_path=f"artifacts/preds/{config_id}__<seed>__val.npz",
             wall_seconds=wall_seconds,
         )
+        if journal is not None:
+            journal.log_eval_result(
+                config_id,
+                val_metrics,
+                wall_seconds,
+                backtest_per_seed_metrics=backtest_metrics,
+                target_slot=target_slot,
+                fragment_impl=fragment.impl,
+                fragment_params=fragment.params,
+                gpu_seconds=result.gpu_seconds,
+                tokens=result.tokens_in + result.tokens_out,
+                node=node,
+            )
+
+        return result
     except Exception as exc:  # noqa: BLE001 - must never escape, see docstring
         wall_seconds = time.perf_counter() - start
         error_class = errors_module.classify(exc, traceback.format_exc())

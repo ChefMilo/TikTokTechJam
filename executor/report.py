@@ -254,7 +254,14 @@ def _write_iterations_md(events: list[JournalEvent], by_node: dict, out_dir: Pat
             lines.append("")
 
         for recovery in kinds.get(EventKind.RECOVERY, []):
-            lines.append(f"**Recovery**: {recovery.payload}")
+            # A clean sentence, not the raw payload dict — this line is
+            # what tells a reader "the taxonomy handled this on purpose"
+            # rather than "something crashed and here's the debug dump".
+            # Pairs with the Error line above it: error_class names WHAT
+            # went wrong, this names WHAT WAS DONE about it.
+            policy = recovery.payload.get("policy")
+            message = recovery.payload.get("message")
+            lines.append(f"**Recovery** (policy=`{policy}`): {message}")
             lines.append("")
 
         for blocked in kinds.get(EventKind.SLOT_BLOCKED, []):
@@ -321,9 +328,17 @@ def _write_results_md(
         best_gauc = best_ndcg = best_primary = None
 
     final_iteration = events[-1].iteration if events else 0
-    total_wall_seconds = sum(
-        e.payload.get("wall_seconds", 0.0) for e in events if e.kind is EventKind.EVAL_RESULT
-    )
+    eval_results = [e for e in events if e.kind is EventKind.EVAL_RESULT]
+    total_wall_seconds = sum(e.payload.get("wall_seconds", 0.0) for e in eval_results)
+    # Computed from the journal, not a fixed string — every EVAL_RESULT
+    # carries gpu_seconds/tokens now (see executor/journal.py's
+    # log_eval_result), defaulting to 0 for a candidate that recorded
+    # neither (true of every candidate today: no GPU, no LLM in this
+    # pipeline). Summing rather than hardcoding means the day a real
+    # LLM/GPU cost shows up here, this table reports it without anyone
+    # having to remember to come back and un-hardcode it.
+    total_gpu_seconds = sum(e.payload.get("gpu_seconds", 0.0) for e in eval_results)
+    total_tokens = sum(e.payload.get("tokens", 0) for e in eval_results)
     intervention_count = sum(1 for e in events if e.kind is EventKind.INTERVENTION)
 
     def _fmt(value: Optional[float]) -> str:
@@ -345,7 +360,8 @@ def _write_results_md(
         f"| Delta vs official baseline primary ({BASELINE_PRIMARY}) | {_delta(best_primary, BASELINE_PRIMARY)} |",
         f"| Iterations used | {final_iteration} / {ITERATION_CAP} |",
         f"| Total agent wall-clock (s) | {total_wall_seconds:.1f} |",
-        "| Total tokens | 0 (no LLM in the loop yet) |",
+        f"| Total GPU-seconds | {total_gpu_seconds:.1f} |",
+        f"| Total tokens | {total_tokens} |",
         f"| Manual interventions | {intervention_count} |",
     ]
     if training_wall_clock_seconds is not None:
