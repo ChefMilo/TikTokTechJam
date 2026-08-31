@@ -89,6 +89,23 @@ def test_log_decision_records_n_seeds(tmp_path):
     assert replayed[-1].payload["n_seeds"] == 5
 
 
+def test_log_convergence_check_records_delta_epsilon_and_clears_flag(tmp_path):
+    path = tmp_path / "journal.jsonl"
+    journal = Journal(str(path), run_id="run-1")
+    verdict = Verdict(accept=True, delta=0.00083, ci95=(0.0003, 0.0014), n_seeds=3, backtest_delta=0.0009, reason="ok")
+
+    event = journal.log_convergence_check(verdict, clears_epsilon=False, epsilon=0.002)
+
+    assert event.kind == EventKind.CONVERGENCE_CHECK
+    assert event.payload["delta"] == 0.00083
+    assert event.payload["epsilon"] == 0.002
+    assert event.payload["clears_epsilon"] is False
+    assert event.payload["accept"] is True
+
+    replayed = Journal.replay(str(path))
+    assert replayed[-1].kind == EventKind.CONVERGENCE_CHECK
+
+
 def test_log_decision_advances_iteration_only_on_accept(tmp_path):
     path = tmp_path / "journal.jsonl"
     journal = Journal(str(path), run_id="run-1")

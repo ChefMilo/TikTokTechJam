@@ -4,7 +4,7 @@ journal so it doesn't need a real controller loop or a real training run.
 
 import csv
 
-from contracts import Citation, Metrics, Verdict
+from contracts import Citation, ErrorClass, Metrics, Verdict
 from executor.journal import Journal
 from executor.report import render
 
@@ -128,3 +128,92 @@ def test_forecast_calibration_skips_nodes_missing_either_side(tmp_path):
 
     content = (out_dir / "forecast_calibration.md").read_text(encoding="utf-8")
     assert "no node has both" in content
+
+
+def _build_journal_with_one_failure(path: str) -> None:
+    journal = Journal(path, run_id="run-1")
+    journal.log_run_start(seeds=[0, 1, 2])
+    journal.log_hypothesis(
+        "model", "try lightgbm",
+        Citation(key="ke2017lightgbm", url="https://example.com", library_entry="methods/library/lightgbm.yaml#gbdt"),
+        expected_gain=0.006, expected_cost_s=90.0, node=1,
+    )
+    journal.log_eval_start("cfg_lgbm", node=1)
+    journal.log_error(
+        ErrorClass.CONTRACT,
+        "NotImplementedError(\"no realization implemented for model impl 'lightgbm'\")",
+        policy="skip_unimplemented",
+        node=1,
+    )
+    journal.log_recovery("skip_unimplemented", "continuing to next candidate", node=1)
+    journal.log_finalize(stop_reason="cap")
+
+
+def test_iterations_md_renders_errors_and_recovery_table(tmp_path):
+    journal_path = tmp_path / "journal.jsonl"
+    _build_journal_with_one_failure(str(journal_path))
+    out_dir = tmp_path / "report"
+
+    render(str(journal_path), output_dir=str(out_dir))
+
+    content = (out_dir / "iterations.md").read_text(encoding="utf-8")
+    assert "## Errors and recovery" in content
+    assert "contract" in content
+    assert "skip_unimplemented" in content
+    assert "the run continued past every one" in content
+
+
+def test_results_md_summarizes_failures(tmp_path):
+    journal_path = tmp_path / "journal.jsonl"
+    _build_journal_with_one_failure(str(journal_path))
+    out_dir = tmp_path / "report"
+
+    render(str(journal_path), output_dir=str(out_dir))
+
+    content = (out_dir / "results.md").read_text(encoding="utf-8")
+    assert "1 candidate(s) failed" in content
+    assert "contract" in content
+    assert "reached FINALIZE" in content
+
+
+def test_render_accepts_training_wall_clock_seconds(tmp_path):
+    journal_path = tmp_path / "journal.jsonl"
+    _build_synthetic_journal(str(journal_path))
+    out_dir = tmp_path / "report"
+
+    render(str(journal_path), output_dir=str(out_dir), training_wall_clock_seconds=1234.5)
+
+    content = (out_dir / "results.md").read_text(encoding="utf-8")
+    assert "1234.5" in content
+
+
+def test_results_md_excludes_baseline_adoption_from_accepted_count(tmp_path):
+    """A DECISION establishing the initial incumbent (reason names
+    "initial incumbent") accepted trivially, not because it beat
+    anything — it must not inflate "Accepted as improvements"."""
+    journal_path = tmp_path / "journal.jsonl"
+    journal = Journal(str(journal_path), run_id="run-1")
+    journal.log_run_start()
+
+    baseline_verdict = Verdict(
+        accept=True, delta=0.0, ci95=(0.0, 0.0), n_seeds=3, backtest_delta=0.0,
+        reason="baseline_reproduce adopted as initial incumbent; no prior candidate to compare against",
+    )
+    journal.log_decision(baseline_verdict, node=1)
+    journal.log_convergence_check(baseline_verdict, clears_epsilon=False, epsilon=0.002, node=1)
+
+    real_verdict = Verdict(
+        accept=True, delta=0.0009, ci95=(0.0003, 0.0015), n_seeds=3, backtest_delta=0.0008,
+        reason="paired CI excludes zero and backtest confirms",
+    )
+    journal.log_decision(real_verdict, node=2)
+    journal.log_convergence_check(real_verdict, clears_epsilon=False, epsilon=0.002, node=2)
+    journal.log_finalize(stop_reason="cap")
+
+    out_dir = tmp_path / "report"
+    render(str(journal_path), output_dir=str(out_dir))
+
+    content = (out_dir / "results.md").read_text(encoding="utf-8")
+    assert "Baseline adopted (not an improvement): 1" in content
+    assert "Accepted as improvements: 1" in content
+    assert "Accepted: 2" not in content

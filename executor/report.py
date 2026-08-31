@@ -99,23 +99,40 @@ def _format_hypothesis(event: JournalEvent) -> list[str]:
     return lines
 
 
+def _format_metrics_table(per_seed: dict) -> list[str]:
+    lines = ["| seed | GAUC | nDCG@5 | primary |", "|---|---|---|---|"]
+    for seed in sorted(per_seed, key=int):
+        values = per_seed[seed]["values"]
+        primary = per_seed[seed]["primary"]
+        gauc = values.get("GAUC")
+        ndcg = values.get("nDCG@5")
+        lines.append(
+            f"| {seed} | {gauc:.4f} | {ndcg:.4f} | {primary:.4f} |"
+            if gauc is not None and ndcg is not None
+            else f"| {seed} | - | - | {primary:.4f} |"
+        )
+    return lines
+
+
 def _format_eval_result(event: JournalEvent) -> list[str]:
     payload = event.payload
     lines = [f"**Result** (config_id=`{payload.get('config_id')}`)", ""]
     per_seed = payload.get("per_seed") or {}
     if per_seed:
-        lines.append("| seed | GAUC | nDCG@5 | primary |")
-        lines.append("|---|---|---|---|")
-        for seed in sorted(per_seed, key=int):
-            values = per_seed[seed]["values"]
-            primary = per_seed[seed]["primary"]
-            gauc = values.get("GAUC")
-            ndcg = values.get("nDCG@5")
-            lines.append(
-                f"| {seed} | {gauc:.4f} | {ndcg:.4f} | {primary:.4f} |"
-                if gauc is not None and ndcg is not None
-                else f"| {seed} | - | - | {primary:.4f} |"
-            )
+        lines.append("Validation:")
+        lines.append("")
+        lines.extend(_format_metrics_table(per_seed))
+    # backtest_per_seed is optional enrichment (see log_eval_result's
+    # docstring) — rendered alongside validation, not instead of it,
+    # because a DECISION's accept reason can read "backtest confirms"
+    # and a judge has no way to check that claim without seeing the
+    # numbers it refers to.
+    backtest_per_seed = payload.get("backtest_per_seed") or {}
+    if backtest_per_seed:
+        lines.append("")
+        lines.append("Backtest:")
+        lines.append("")
+        lines.extend(_format_metrics_table(backtest_per_seed))
     lines.append("")
     lines.append(f"wall_seconds: {payload.get('wall_seconds')}")
     return lines
@@ -125,24 +142,77 @@ def _format_decision(event: JournalEvent) -> list[str]:
     payload = event.payload
     verdict_str = "ACCEPTED" if payload.get("verdict") else "REJECTED"
     ci95 = payload.get("ci95") or [None, None]
+    backtest_delta = payload.get("backtest_delta")
     lines = [
         f"**Verdict: {verdict_str}**",
         "",
         f"- delta: {payload.get('delta_primary'):+.4f} (n_seeds={payload.get('n_seeds')})",
         f"- ci95: [{ci95[0]:.4f}, {ci95[1]:.4f}]" if ci95[0] is not None else "- ci95: n/a",
-        f"- backtest_delta: {payload.get('backtest_delta')}",
+        f"- backtest_delta: {backtest_delta:+.5f}" if backtest_delta is not None else "- backtest_delta: n/a",
         f"- reason: {payload.get('reason')}",
     ]
     return lines
 
 
+def _format_convergence_check(event: JournalEvent) -> str:
+    payload = event.payload
+    delta = payload.get("delta")
+    epsilon = payload.get("epsilon")
+    cleared = "cleared" if payload.get("clears_epsilon") else "did NOT clear"
+    return f"**Convergence check**: delta {delta:+.5f} vs epsilon {epsilon:.3f} — {cleared}"
+
+
+def _format_errors_table(events: list[JournalEvent]) -> list[str]:
+    """A run-level summary of every ERROR event, independent of the
+    per-node Error/Recovery lines _write_iterations_md already renders
+    in each node's own section — this is the "can a judge tell at a
+    glance how many candidates failed and whether the run survived
+    them" view, not a replacement for the per-node narrative.
+    """
+    errors = [e for e in events if e.kind is EventKind.ERROR]
+    if not errors:
+        return []
+    recovered_nodes = {e.node for e in events if e.kind is EventKind.RECOVERY}
+    lines = ["## Errors and recovery", ""]
+    lines.append("| node | error_class | policy | recovered |")
+    lines.append("|---|---|---|---|")
+    for error in errors:
+        error_class = error.payload.get("error_class")
+        policy = error.payload.get("policy", "n/a")
+        recovered = "yes" if error.node in recovered_nodes else "no"
+        lines.append(f"| {error.node} | {error_class} | {policy} | {recovered} |")
+    n_recovered = sum(1 for e in errors if e.node in recovered_nodes)
+    lines.append("")
+    if n_recovered == len(errors):
+        lines.append(f"{len(errors)} candidate(s) failed; the run continued past every one.")
+    else:
+        lines.append(
+            f"{len(errors)} candidate(s) failed; {n_recovered} of them had a logged RECOVERY "
+            f"— the remaining {len(errors) - n_recovered} did not."
+        )
+    lines.append("")
+    return lines
+
+
 def _write_iterations_md(events: list[JournalEvent], by_node: dict, out_dir: Path) -> None:
-    lines = ["# Iterations", ""]
+    lines = [
+        "# Iterations",
+        "",
+        "_`node` counts every evaluation attempted; `iteration` counts "
+        "committed revisions and only advances when a DECISION accepts. "
+        "Several consecutive nodes sharing one iteration number means "
+        "several consecutive rejections, not a stall — see "
+        "executor/journal.py's log_decision docstring._",
+        "",
+    ]
+    lines.extend(_format_errors_table(events))
     last_fragment_by_slot: dict[str, tuple[str, dict[str, Any]]] = {}
 
     for node in sorted(by_node):
         kinds = by_node[node]
-        if not any(k in kinds for k in (EventKind.HYPOTHESIS, EventKind.EVAL_RESULT, EventKind.ERROR)):
+        if not any(
+            k in kinds for k in (EventKind.HYPOTHESIS, EventKind.EVAL_RESULT, EventKind.ERROR)
+        ):
             continue  # a node with only e.g. STAGE_CHANGE has nothing to report here
 
         decisions = kinds.get(EventKind.DECISION, [])
@@ -175,12 +245,23 @@ def _write_iterations_md(events: list[JournalEvent], by_node: dict, out_dir: Pat
             lines.extend(_format_decision(decision))
             lines.append("")
 
+        for check in kinds.get(EventKind.CONVERGENCE_CHECK, []):
+            lines.append(_format_convergence_check(check))
+            lines.append("")
+
         for error in kinds.get(EventKind.ERROR, []):
             lines.append(f"**Error**: `{error.payload.get('error_class')}` — {error.payload.get('excerpt')}")
             lines.append("")
 
         for recovery in kinds.get(EventKind.RECOVERY, []):
             lines.append(f"**Recovery**: {recovery.payload}")
+            lines.append("")
+
+        for blocked in kinds.get(EventKind.SLOT_BLOCKED, []):
+            lines.append(
+                f"**Circuit breaker**: slot `{blocked.payload.get('target_slot')}` blocked "
+                f"after {blocked.payload.get('consecutive_failures')} consecutive failures."
+            )
             lines.append("")
 
         lines.append("---")
@@ -207,7 +288,29 @@ def _select_best_node(by_node: dict) -> Optional[tuple[int, JournalEvent]]:
     return best[0], best[2]
 
 
-def _write_results_md(events: list[JournalEvent], by_node: dict, out_dir: Path) -> None:
+def _convergence_consequence(n_accepted: int, n_cleared: int, epsilon: float) -> str:
+    if n_accepted == 0:
+        return "No candidate was accepted, so the epsilon question does not arise."
+    if n_cleared == 0:
+        return (
+            f"{n_accepted} candidate(s) were accepted as statistically real improvements, "
+            f"but none cleared epsilon={epsilon}. Under the organizers' N=3 no-improvement "
+            "rule, this run would still be judged as stalled despite the real gain(s)."
+        )
+    if n_cleared == n_accepted:
+        return f"All {n_accepted} accepted candidate(s) cleared epsilon={epsilon}; the N=3 counter would reset each time."
+    return (
+        f"{n_cleared} of {n_accepted} accepted candidate(s) cleared epsilon={epsilon}; "
+        f"the other {n_accepted - n_cleared} reset nothing under the organizers' N=3 rule."
+    )
+
+
+def _write_results_md(
+    events: list[JournalEvent],
+    by_node: dict,
+    out_dir: Path,
+    training_wall_clock_seconds: Optional[float] = None,
+) -> None:
     best = _select_best_node(by_node)
     if best is not None:
         _, best_result = best
@@ -245,6 +348,68 @@ def _write_results_md(events: list[JournalEvent], by_node: dict, out_dir: Path) 
         "| Total tokens | 0 (no LLM in the loop yet) |",
         f"| Manual interventions | {intervention_count} |",
     ]
+    if training_wall_clock_seconds is not None:
+        lines.append(f"| Total training wall-clock (s), measured | {training_wall_clock_seconds:.1f} |")
+    lines.append("")
+    lines.append(
+        "_\"Total agent wall-clock\" above sums each EVAL_RESULT's own "
+        "wall_seconds — it covers only the time this render's run spent "
+        "re-evaluating, which is ~0s whenever candidates are rebuilt from "
+        "cache rather than trained. Actual training wall-clock is "
+        + (
+            "reported in the row above, passed in separately by the caller."
+            if training_wall_clock_seconds is not None
+            else "not reported here — no measured total was passed to render()."
+        )
+        + "_"
+    )
+
+    convergence_events = [e for e in events if e.kind is EventKind.CONVERGENCE_CHECK]
+    if convergence_events:
+        # A DECISION whose reason names "initial incumbent" (see
+        # scripts/run_agent.py's baseline_verdict) accepted trivially —
+        # it established the baseline, it didn't beat one. Counting it
+        # alongside real gate acceptances overstates how many candidates
+        # this run actually improved on something.
+        decisions_by_node = {e.node: e for e in events if e.kind is EventKind.DECISION}
+        baseline_nodes = {
+            node
+            for node, decision in decisions_by_node.items()
+            if "initial incumbent" in (decision.payload.get("reason") or "").lower()
+        }
+        n_checks = len(convergence_events)
+        n_baseline = sum(1 for e in convergence_events if e.node in baseline_nodes)
+        n_accepted = sum(
+            1 for e in convergence_events if e.payload.get("accept") and e.node not in baseline_nodes
+        )
+        n_cleared = sum(
+            1 for e in convergence_events if e.payload.get("clears_epsilon") and e.node not in baseline_nodes
+        )
+        epsilon = convergence_events[0].payload.get("epsilon")
+        lines.append("")
+        lines.append("## Convergence")
+        lines.append("")
+        lines.append(f"- Candidates decided: {n_checks}")
+        if n_baseline:
+            lines.append(f"- Baseline adopted (not an improvement): {n_baseline}")
+        lines.append(f"- Accepted as improvements: {n_accepted}")
+        lines.append(f"- Cleared epsilon={epsilon}: {n_cleared}")
+        lines.append(f"- Consequence: {_convergence_consequence(n_accepted, n_cleared, epsilon)}")
+
+    errors = [e for e in events if e.kind is EventKind.ERROR]
+    if errors:
+        recovered_nodes = {e.node for e in events if e.kind is EventKind.RECOVERY}
+        n_recovered = sum(1 for e in errors if e.node in recovered_nodes)
+        classes = sorted({e.payload.get("error_class") for e in errors})
+        lines.append("")
+        lines.append(
+            f"{len(errors)} candidate(s) failed (error classes: {', '.join(classes)}); "
+            f"the run continued past all {n_recovered} of them and reached FINALIZE."
+            if n_recovered == len(errors)
+            else f"{len(errors)} candidate(s) failed (error classes: {', '.join(classes)}); "
+            f"{n_recovered} recovered, {len(errors) - n_recovered} did not."
+        )
+
     (out_dir / "results.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -323,9 +488,21 @@ def _write_forecast_calibration_md(by_node: dict, out_dir: Path) -> None:
     (out_dir / "forecast_calibration.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def render(journal_path: str, output_dir: str = "artifacts/report") -> None:
+def render(
+    journal_path: str,
+    output_dir: str = "artifacts/report",
+    training_wall_clock_seconds: Optional[float] = None,
+) -> None:
     """Reads `journal_path` and writes iterations.md, results.md,
     trajectory.csv, and forecast_calibration.md into `output_dir`.
+
+    `training_wall_clock_seconds` is optional and defaults to None: a
+    caller that rebuilds every CandidateResult from cache (e.g.
+    scripts/run_agent.py) has real EVAL_RESULT.wall_seconds of ~0 for
+    every node, which is honest about THIS render but would otherwise
+    make results.md read as if the whole trajectory cost nothing. Pass
+    the real measured total here to have results.md report it
+    separately instead of silently omitting it.
     """
     events = Journal.replay(journal_path)
     by_node = _group_by_node(events)
@@ -334,6 +511,6 @@ def render(journal_path: str, output_dir: str = "artifacts/report") -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     _write_iterations_md(events, by_node, out_dir)
-    _write_results_md(events, by_node, out_dir)
+    _write_results_md(events, by_node, out_dir, training_wall_clock_seconds=training_wall_clock_seconds)
     _write_trajectory_csv(by_node, out_dir)
     _write_forecast_calibration_md(by_node, out_dir)

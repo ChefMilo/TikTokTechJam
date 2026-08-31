@@ -269,17 +269,97 @@ class Journal:
             node=self.current_node if node is None else node,
         )
 
+    def log_convergence_check(
+        self,
+        verdict: Verdict,
+        clears_epsilon: bool,
+        epsilon: float,
+        *,
+        iteration: Optional[int] = None,
+        node: Optional[int] = None,
+    ) -> JournalEvent:
+        """`clears_epsilon` and `epsilon` are passed in rather than
+        computed here — harness.gate.clears_convergence_epsilon(verdict)
+        is the one real implementation of that test (see its own
+        docstring for why it's a distinct question from verdict.accept);
+        this module stays agnostic to gate's internals and just records
+        what the caller already decided, the same way log_decision
+        records a Verdict it did not itself produce.
+        """
+        payload = {
+            "delta": verdict.delta,
+            "epsilon": epsilon,
+            "clears_epsilon": clears_epsilon,
+            "accept": verdict.accept,
+        }
+        return self._emit(
+            EventKind.CONVERGENCE_CHECK,
+            payload,
+            iteration=self.current_iteration if iteration is None else iteration,
+            node=self.current_node if node is None else node,
+        )
+
     def log_error(
         self,
         error_class: ErrorClass,
         excerpt: str,
         *,
+        policy: Optional[str] = None,
         iteration: Optional[int] = None,
         node: Optional[int] = None,
     ) -> JournalEvent:
-        payload = {"error_class": error_class.value, "excerpt": excerpt}
+        """`policy` is the repair strategy executor.errors.policy_for
+        resolved for `error_class` — optional so existing callers that
+        predate the error taxonomy (executor.run's own pre-classify
+        history, and any test fixture) keep working unchanged.
+        """
+        payload: dict[str, Any] = {"error_class": error_class.value, "excerpt": excerpt}
+        if policy is not None:
+            payload["policy"] = policy
         return self._emit(
             EventKind.ERROR,
+            payload,
+            iteration=self.current_iteration if iteration is None else iteration,
+            node=self.current_node if node is None else node,
+        )
+
+    def log_recovery(
+        self,
+        policy: str,
+        message: str,
+        *,
+        iteration: Optional[int] = None,
+        node: Optional[int] = None,
+    ) -> JournalEvent:
+        """Records that the run continued past a failure logged by
+        log_error at the same node — `policy` should match that error's
+        policy (e.g. "skip_unimplemented"), so a reader can see the
+        failure and its resolution as one pair without cross-referencing
+        error_class -> POLICY themselves.
+        """
+        payload = {"policy": policy, "message": message}
+        return self._emit(
+            EventKind.RECOVERY,
+            payload,
+            iteration=self.current_iteration if iteration is None else iteration,
+            node=self.current_node if node is None else node,
+        )
+
+    def log_slot_blocked(
+        self,
+        target_slot: str,
+        consecutive_failures: int,
+        *,
+        iteration: Optional[int] = None,
+        node: Optional[int] = None,
+    ) -> JournalEvent:
+        """Records that `target_slot` hit the circuit breaker's failure
+        threshold and the caller (scripts/run_agent.py's simple
+        per-slot failure-count dict) will stop proposing into it.
+        """
+        payload = {"target_slot": target_slot, "consecutive_failures": consecutive_failures}
+        return self._emit(
+            EventKind.SLOT_BLOCKED,
             payload,
             iteration=self.current_iteration if iteration is None else iteration,
             node=self.current_node if node is None else node,

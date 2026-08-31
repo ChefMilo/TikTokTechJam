@@ -2,16 +2,20 @@
 returns a contracts.CandidateResult.
 
 SCOPE DISCIPLINE: minimum spine only. No sandbox, no subprocess
-isolation, no error taxonomy (a failure is reported, never classified —
-see below). See EXECUTOR_SURVEY.md for what comes after.
+isolation. A failure is classified (executor.errors.classify) but not
+repaired — see executor/errors.py's module docstring for exactly which
+classes/policies are actually exercised versus declared for later. See
+EXECUTOR_SURVEY.md for what comes after.
 """
 
 from __future__ import annotations
 
 import time
+import traceback
 from typing import Optional, Sequence
 
-from contracts import CandidateResult, ErrorClass, Metrics, SlotConfig, SlotName, Status
+from contracts import CandidateResult, Metrics, SlotConfig, SlotName, Status
+from executor import errors as errors_module
 from executor import realize as realize_module
 from executor.journal import Journal
 from harness import backtest, cache, data, metrics
@@ -39,10 +43,9 @@ def run_candidate(
     CandidateResult(status=Status.FAILED, error_excerpt=...) — one bad
     candidate must not take the whole run down with it, and an exception
     escaping here would also lose whatever the caller wanted to journal
-    about this attempt. `error_class` is left at ErrorClass.UNKNOWN
-    rather than actually classified: UNKNOWN is the honest "something
-    failed, not yet triaged" value, not an attempt at the real taxonomy,
-    which is deliberately out of scope for this spine (EXECUTOR_SURVEY.md).
+    about this attempt. `error_class` comes from executor.errors.classify
+    — see that module's docstring for which classes are actually
+    exercised versus declared for a repair loop that doesn't exist yet.
     """
     start = time.perf_counter()
     config_id = "unknown"
@@ -121,19 +124,21 @@ def run_candidate(
         )
     except Exception as exc:  # noqa: BLE001 - must never escape, see docstring
         wall_seconds = time.perf_counter() - start
+        error_class = errors_module.classify(exc, traceback.format_exc())
+        policy = errors_module.policy_for(error_class)
         if journal is not None:
             if not eval_started:
                 # Nothing was logged yet for this attempt (the failure
                 # happened before config_id was even known) — still worth
                 # a node of its own so the failure shows up in the log.
                 journal.log_eval_start(config_id, node=node)
-            journal.log_error(ErrorClass.UNKNOWN, repr(exc)[:2000], node=node)
+            journal.log_error(error_class, repr(exc)[:2000], policy=policy, node=node)
         return CandidateResult(
             config_id=config_id,
             status=Status.FAILED,
             val={},
             backtest={},
-            error_class=ErrorClass.UNKNOWN,
+            error_class=error_class,
             error_excerpt=repr(exc)[:2000],
             wall_seconds=wall_seconds,
         )
