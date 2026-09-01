@@ -26,18 +26,33 @@ def run_candidate(
     target_slot: SlotName,
     seeds: Sequence[int] = (0, 1, 2),
     journal: Optional[Journal] = None,
+    force_retrain: bool = False,
 ) -> CandidateResult:
     """Realizes `fragment` (a proposed change to `target_slot`) across
     `seeds`: a validation pass (train on data.load("train"), score on
     data.load("val")) and a backtest pass (harness.backtest.split()'s
     fit/score windows), for each seed.
 
+    CACHE SHORT-CIRCUIT: `config_id` is seed-independent (see
+    contracts.PipelineConfig.seed), so it's computed once, up front, from
+    a single build_config() call before any per-seed work — both the
+    cache check below and the per-seed loop (if training does happen)
+    reuse it. If every requested seed already has BOTH "val" and
+    "backtest" cached for this config_id, training is skipped entirely:
+    predictions are loaded and re-scored (cheap — no model fit), and the
+    returned CandidateResult is otherwise identical to a freshly-trained
+    one. `wall_seconds` on a cache hit reflects only that re-scoring, not
+    training — EVAL_RESULT's `served_from_cache` field (see
+    executor.journal.log_eval_result) and this function's own print are
+    both there so a reader never has to guess which wall_seconds figures
+    are real. Pass `force_retrain=True` to bypass the check.
+
     `journal` is optional and defaults to None so existing callers (the
     I1 smoke test in particular) keep working unchanged. When given, one
-    EVAL_START is logged before training and one EVAL_RESULT after
-    (or ERROR on failure) — both sharing the same node number, computed
-    once up front, so a reader can tell they describe the same attempt
-    regardless of whether it was accepted.
+    EVAL_START is logged before training (or before a cache-hit re-score)
+    and one EVAL_RESULT after (or ERROR on failure) — both sharing the
+    same node number, computed once up front, so a reader can tell they
+    describe the same attempt regardless of whether it was accepted.
 
     Never raises. A failure anywhere becomes
     CandidateResult(status=Status.FAILED, error_excerpt=...) — one bad
@@ -52,6 +67,57 @@ def run_candidate(
     node = journal.current_node + 1 if journal is not None else None
     eval_started = False
     try:
+        config_id = realize_module.build_config(fragment, target_slot, seed=seeds[0]).config_id
+
+        cache_hit = not force_retrain and all(
+            cache.exists(config_id, seed, split) for seed in seeds for split in ("val", "backtest")
+        )
+
+        if cache_hit:
+            val_metrics = {}
+            backtest_metrics = {}
+            for seed in seeds:
+                user_ids, labels, scores = cache.load_predictions(config_id, seed, "val")
+                val_metrics[seed] = metrics.evaluate(user_ids, labels, scores)
+                bt_user_ids, bt_labels, bt_scores = cache.load_predictions(config_id, seed, "backtest")
+                backtest_metrics[seed] = metrics.evaluate(bt_user_ids, bt_labels, bt_scores)
+
+            wall_seconds = time.perf_counter() - start
+            print(
+                f"run_candidate: config_id={config_id!r} served from cache for seeds "
+                f"{list(seeds)} (val+backtest); skipping training"
+            )
+            # No GPU, no LLM anywhere in this pipeline today — both are
+            # genuinely 0.0/0, not unknown. Read from a CandidateResult
+            # built below rather than hand-summed here, so the journal
+            # and the returned object can never disagree about cost.
+            result = CandidateResult(
+                config_id=config_id,
+                status=Status.OK,
+                val=val_metrics,
+                backtest=backtest_metrics,
+                val_pred_path=f"artifacts/preds/{config_id}__<seed>__val.npz",
+                wall_seconds=wall_seconds,
+            )
+            if journal is not None:
+                journal.log_eval_start(config_id, node=node)
+                eval_started = True
+                journal.log_eval_result(
+                    config_id,
+                    val_metrics,
+                    wall_seconds,
+                    backtest_per_seed_metrics=backtest_metrics,
+                    target_slot=target_slot,
+                    fragment_impl=fragment.impl,
+                    fragment_params=fragment.params,
+                    gpu_seconds=result.gpu_seconds,
+                    tokens=result.tokens_in + result.tokens_out,
+                    served_from_cache=True,
+                    node=node,
+                )
+
+            return result
+
         train_rows = data.load("train")
         val_rows = data.load("val")
         fit_rows, score_rows = backtest.split()
@@ -59,16 +125,12 @@ def run_candidate(
         val_metrics: dict[int, Metrics] = {}
         backtest_metrics: dict[int, Metrics] = {}
 
+        if journal is not None:
+            journal.log_eval_start(config_id, node=node)
+            eval_started = True
+
         for seed in seeds:
             config = realize_module.build_config(fragment, target_slot, seed)
-            if config_id == "unknown":
-                # config_id excludes `seed` by construction (see
-                # contracts.PipelineConfig.seed) — identical across every
-                # seed in this loop, so the first one is as good as any.
-                config_id = config.config_id
-                if journal is not None:
-                    journal.log_eval_start(config_id, node=node)
-                    eval_started = True
 
             # --- validation pass ---
             user_ids, labels, scores = realize_module.realize(config, train_rows, val_rows, seed)
@@ -125,6 +187,7 @@ def run_candidate(
                 fragment_params=fragment.params,
                 gpu_seconds=result.gpu_seconds,
                 tokens=result.tokens_in + result.tokens_out,
+                served_from_cache=False,
                 node=node,
             )
 

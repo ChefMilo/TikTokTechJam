@@ -2,6 +2,8 @@
 log_* helpers' payload shapes.
 """
 
+import pytest
+
 from contracts import Citation, EventKind, JournalEvent, Metrics, Verdict
 from executor.journal import Journal
 
@@ -117,3 +119,41 @@ def test_log_decision_advances_iteration_only_on_accept(tmp_path):
     accepted = Verdict(accept=True, delta=0.004, ci95=(0.001, 0.007), n_seeds=3, backtest_delta=0.003, reason="ok")
     journal.log_decision(accepted)
     assert journal.current_iteration == 1
+
+
+def test_default_construction_over_an_existing_journal_appends_and_warns(tmp_path):
+    path = tmp_path / "journal.jsonl"
+    first = Journal(str(path), run_id="run-1")
+    first.log_run_start()
+    first.log_finalize(stop_reason="cap")
+
+    with pytest.warns(UserWarning, match=r"2 event\(s\) already recorded"):
+        second = Journal(str(path), run_id="run-1")
+
+    second.log_run_start()
+    events = Journal.replay(str(path))
+    assert len(events) == 3  # appended, not truncated
+    assert [e.kind for e in events] == [EventKind.RUN_START, EventKind.FINALIZE, EventKind.RUN_START]
+
+
+def test_truncate_true_clears_an_existing_journal_with_no_warning(tmp_path, recwarn):
+    path = tmp_path / "journal.jsonl"
+    first = Journal(str(path), run_id="run-1")
+    first.log_run_start()
+    first.log_finalize(stop_reason="cap")
+
+    second = Journal(str(path), run_id="run-2", truncate=True)
+    assert len(recwarn) == 0  # truncating must not also warn
+    assert second.current_iteration == 0
+    assert second.current_node == 0
+
+    second.log_run_start()
+    events = Journal.replay(str(path))
+    assert len(events) == 1  # the prior run's events are gone
+    assert events[0].run_id == "run-2"
+
+
+def test_default_construction_over_a_fresh_path_does_not_warn(tmp_path, recwarn):
+    path = tmp_path / "journal.jsonl"
+    Journal(str(path), run_id="run-1")
+    assert len(recwarn) == 0

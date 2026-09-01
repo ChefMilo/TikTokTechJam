@@ -186,7 +186,11 @@ def _log_decision_and_convergence(journal: Journal, node: int, verdict: Verdict,
 def main() -> None:
     start = time.perf_counter()
 
-    journal = Journal(str(JOURNAL_PATH), run_id="run_agent")
+    # truncate=True: this script always reruns the same fixed sequence
+    # from scratch — appending onto a prior invocation's journal would
+    # double every node's events under shared node numbers (this has
+    # happened before). See executor/journal.py's Journal.__init__.
+    journal = Journal(str(JOURNAL_PATH), run_id="run_agent", truncate=True)
     journal.log_run_start(
         moves=list(ALL_MOVES) + ["ensemble"],
         cache_rebuild_moves=list(CACHE_REBUILD_MOVES),

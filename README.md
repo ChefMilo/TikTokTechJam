@@ -29,6 +29,8 @@ The codebase is split into four independently-owned packages plus a shared contr
 | `controller/` | The agent's state machine, search policy, port protocols, convergence tracking |
 | `executor/` | Realizing a `PipelineConfig` into trained predictions, the error taxonomy, the journal writer, the report renderer |
 | `methods/` | The hypothesis library — currently a deterministic ten-move script (`ScriptedGenerator`), standing in for the `GeneratorPort` |
+| `autonomy/` | Adapters wiring the real `Controller` to the real `harness`/`executor` (`GeneratorPort`/`RealizerPort` implementations over the scripted moves), the code-fingerprint/manual-intervention integrity system (`INTERVENTION_POLICY.md`, `integrity.py`), and the autonomy-section renderer (`render.py`) that reads a Controller journal directly |
+| `manual/` | The hand-built "manual ceiling" reference pipeline — measures headroom above the organizers' published baseline independently of the agent; never goes through the `Controller` |
 
 `contracts.py` at the repo root is the frozen cross-package interface — dataclasses only, no behavior. Every package imports from it rather than reaching into another package's internals.
 
@@ -81,15 +83,17 @@ python -c "import harness, controller, executor, methods"
 Run in order from the repo root:
 
 ```bash
-pytest                              # 446 tests as of this writing
+pytest                              # 559 tests as of this writing
 python scripts/seed_variance.py     # ~4 min
 python scripts/run_agent.py         # ~12 min
+python scripts/run_controller.py    # varies with --max-nodes-per-stage / --seeds
 python scripts/make_submission.py   # ~2.5 min
 ```
 
-- **`pytest`** — the full test suite for `harness/`, `controller/`, `executor/`, `methods/`, and the `manual/` reference runner.
+- **`pytest`** — the full test suite for `harness/`, `controller/`, `executor/`, `methods/`, `autonomy/`, and the `manual/` reference runner.
 - **`scripts/seed_variance.py`** — trains the FM baseline at 5 seeds on validation and measures per-seed noise (sigma), writing `artifacts/seed_variance.json`. `harness/gate.py`'s acceptance thresholds are calibrated against this file.
-- **`scripts/run_agent.py`** — the full ten-move-plus-ensemble run described under Results below. Writes `artifacts/journal_run.jsonl` (the append-only decision log) and renders `artifacts/report/{iterations,results,forecast_calibration}.md` + `trajectory.csv`. Moves 1, 2, 3, 8, and the ensemble rebuild their `CandidateResult`s from already-cached predictions (no training); moves 4, 5, 6, 7, 9, and 10 are executed for real, since nothing has run them before.
+- **`scripts/run_agent.py`** — the fixed ten-move-plus-ensemble replay described under Results below, and **the driver that produced the submitted result**: `scripts/make_submission.py` retrains the exact candidate this run accepts. Writes `artifacts/journal_run.jsonl` (the append-only decision log) and renders `artifacts/report/{iterations,results,forecast_calibration}.md` + `trajectory.csv`. Moves 1, 2, 3, 8, and the ensemble rebuild their `CandidateResult`s from already-cached predictions (no training); moves 4, 5, 6, 7, 9, and 10 are executed for real, since nothing has run them before.
+- **`scripts/run_controller.py`** — drives the real `controller.Controller` loop end to end (real hypotheses via the scripted moves through `GeneratorPort`/`RealizerPort`, the real `harness.gate`, real training through `executor.run.run_candidate`), writing `artifacts/journal_controller.jsonl` and, with `--report`, rendering it via `executor/report.py`. This is the actual unattended search loop, separate from `run_agent.py`'s fixed replay above; runtime scales with `--max-nodes-per-stage`/`--seeds` (a `--max-nodes-per-stage 1 --seeds 0` smoke run took ~8 minutes). It has not yet found a candidate that beats `run_agent.py`'s ensemble.
 - **`scripts/make_submission.py`** — retrains the accepted 3-seed rank-average ensemble on the full training split, scores the hidden test split, and writes/validates `artifacts/submission_test.csv` against the organizer's own `submit.py --check`.
 
 ## Results
@@ -131,6 +135,7 @@ Six hypotheses were actually measured (1, 2, 3, 5, 8, 10, plus the ensemble); fo
 - **Four of ten scripted moves have no realizer implementation** (`multitask_bce`, `duration_debias_cwm`, `lightgbm`, `popularity_blend` — see the table above). They're real, motivated hypotheses (each cites a source), just not yet wired to training code.
 - **Measured validation sigma (0.000353) is a lower bound, not an honest estimate.** The vendor FM baseline early-stops on validation primary itself, so each seed's reported score is a max over ~40 epochs on the very split being measured — that compresses variance relative to a single evaluation. `harness/gate.py` accounts for this by flooring its acceptance threshold at `max(3*sigma, 0.002)` rather than trusting `3*sigma` alone.
 - **Only the additive move (the rank-average ensemble) beat the baseline.** Every component-replacing move — different weighting, a hard recency cutoff, a pairwise objective, different FM capacity, a different learning-rate schedule — either lost outright or landed inside the noise gate's rejection region. On this dataset, at this point in the search, combining seeds of the same model beat swapping any single component of it.
+- **The manual ceiling (`manual/`) exists but has never been run.** It's a real, hand-built reference pipeline (`manual/run.py`, `manual/encode.py`) meant to measure how much headroom exists above the organizers' published FM baseline (0.6016) independently of the agent — but no cached predictions, journal, or results file for either of its variants (`manual_baseline_fm_k16`, `manual_crosses_v1`) exist anywhere in this repo. So the accepted ensemble's +0.00083 has no measured ceiling of our own to be judged against; only the organizers' own published baseline and oracle figures are available for comparison.
 - **The error taxonomy (`executor/errors.py`) declares repair policies for `OOM`, `TIMEOUT`, and `NAN_LOSS`** (`simplify_retry`, `simplify_retry`, `lower_lr_retry` respectively) **that were never exercised.** Only `ErrorClass.CONTRACT` / policy `skip_unimplemented` actually fired in this run, because the only failure mode any scripted move produced was an unimplemented slot/impl combination. The other classes have real, narrow detection rules (see `executor/errors.py`'s `classify()`) but no retry loop has ever been built or tested behind them — they're declared for the day that work happens, not evidence it already has.
 
 ## Team member contributions

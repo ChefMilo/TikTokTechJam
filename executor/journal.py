@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Optional
 
@@ -45,15 +46,38 @@ def _now_iso() -> str:
 class Journal:
     """Appends JournalEvents to `path` as JSONL, one line per event."""
 
-    def __init__(self, path: str, run_id: str) -> None:
+    def __init__(self, path: str, run_id: str, truncate: bool = False) -> None:
+        """`truncate` defaults to False: crash-resume depends on append
+        being the default, so a Journal pointed at an existing file picks
+        up where it left off unless told otherwise — that is the whole
+        point of replay-based recovery. Pass `truncate=True` when the
+        caller always intends a fresh run (e.g. scripts/run_agent.py,
+        which reruns the same fixed sequence every invocation); it
+        deletes any existing file at `path` before the first write. With
+        the default False, constructing a Journal over an existing
+        non-empty file warns instead of silently appending onto it — the
+        append behaviour has silently doubled a run's events before (two
+        invocations sharing one un-cleared journal file), and a warning
+        is the difference between that being visible and being a mystery
+        in the rendered report.
+        """
         self.path = Path(path)
         self.run_id = run_id
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if truncate:
+            self.path.unlink(missing_ok=True)
         # Initializes position from whatever's already on disk — a
         # Journal pointed at an existing file (crash-resume) picks up
         # exactly where the last complete event left off, without the
         # caller having to replay it manually first.
         existing = self.replay(self.path)
+        if existing and not truncate:
+            warnings.warn(
+                f"Journal({str(self.path)!r}): {len(existing)} event(s) already "
+                "recorded at this path; new events will be appended to them, not "
+                "start a fresh run. Pass truncate=True if a fresh run was intended.",
+                stacklevel=2,
+            )
         self._last_event: Optional[JournalEvent] = existing[-1] if existing else None
 
     def append(self, event: JournalEvent) -> None:
@@ -208,6 +232,7 @@ class Journal:
         fragment_params: Optional[dict[str, Any]] = None,
         gpu_seconds: float = 0.0,
         tokens: int = 0,
+        served_from_cache: bool = False,
         iteration: Optional[int] = None,
         node: Optional[int] = None,
     ) -> JournalEvent:
@@ -223,6 +248,12 @@ class Journal:
         matches CandidateResult's own defaults: a caller with nothing to
         report (every candidate in this pipeline today — no GPU, no LLM)
         gets an honest zero, not a missing key a reader has to guess about.
+
+        `served_from_cache` is always present (default False) rather than
+        an optional field omitted when false — a reader checking whether
+        `wall_seconds` is real training time or a near-zero cache replay
+        needs to be able to tell "this run recorded False" from "this
+        journal predates the field existing" without guessing.
         """
         payload: dict[str, Any] = {
             "config_id": config_id,
@@ -233,6 +264,7 @@ class Journal:
             "wall_seconds": wall_seconds,
             "gpu_seconds": gpu_seconds,
             "tokens": tokens,
+            "served_from_cache": served_from_cache,
             "target_slot": target_slot,
             "fragment_impl": fragment_impl,
             "fragment_params": fragment_params,
