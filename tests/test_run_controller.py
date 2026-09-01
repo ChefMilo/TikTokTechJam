@@ -202,6 +202,15 @@ def test_build_controller_passes_the_policy_order_through(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+# EVERY test that calls run_controller.main() MUST pass --report-dir at a
+# tmp_path. Both --journal and --report-dir default to real paths under
+# artifacts/, and main() always writes the autonomy section and (since
+# rendering became the default) the metric report. A test that omits
+# either one silently overwrites committed run evidence with stub-run
+# output. tests/test_autonomy_render.py's `_run` helper bakes both in;
+# this module passes them explicitly at each call site.
+
+
 def _stub_training(monkeypatch):
     """Replace the real executor with a synthetic one.
 
@@ -235,6 +244,12 @@ def test_main_runs_and_journals_without_training(tmp_path, monkeypatch, capsys):
             "--seeds", "0,1,2",
             "--max-nodes-per-stage", "1",
             "--journal", str(journal_path),
+            # Without this the run writes its autonomy section, and now
+            # its metric report too, into the REAL artifacts/report_controller
+            # — overwriting a genuine run's evidence with a stub run's,
+            # under a header naming a pytest tmp path. See this module's
+            # note above _stub_training.
+            "--report-dir", str(tmp_path / "report"),
             "--run-id", "smoke-run",
         ]
     )
@@ -267,7 +282,8 @@ def test_a_second_run_into_the_same_journal_stays_distinguishable(tmp_path, monk
 
     for run_id in ("run-one", "run-two"):
         run_controller.main(
-            ["--max-nodes-per-stage", "1", "--journal", str(journal_path), "--run-id", run_id]
+            ["--max-nodes-per-stage", "1", "--journal", str(journal_path),
+             "--report-dir", str(tmp_path / "report"), "--run-id", run_id]
         )
 
     replayed = Journal.replay(str(journal_path))
