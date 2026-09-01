@@ -10,7 +10,8 @@
 | Delta vs official baseline primary (0.6016) | +0.0007 |
 | Iterations used | 2 / 50 |
 | Total agent wall-clock (s) | 21.7 |
-| Total tokens | 0 (no LLM in the loop yet) |
+| Total GPU-seconds | 0.0 |
+| Total tokens | 0 |
 | Manual interventions | 0 |
 | Total training wall-clock (s), measured | 1935.8 |
 

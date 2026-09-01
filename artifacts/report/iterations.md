@@ -140,7 +140,7 @@ wall_seconds: 0.0
 
 **Error**: `contract` — NotImplementedError("executor.realize: no realization implemented for objective impl 'multitask_bce'")
 
-**Recovery**: {'message': 'move 4 (objective/multitask_bce) failed with contract; run continues to the next candidate.', 'policy': 'skip_unimplemented'}
+**Recovery** (policy=`skip_unimplemented`): move 4 (objective/multitask_bce) failed with contract; run continues to the next candidate.
 
 ---
 
@@ -175,7 +175,7 @@ Backtest:
 | 1 | 0.6603 | 0.5166 | 0.5884 |
 | 2 | 0.6593 | 0.5167 | 0.5880 |
 
-wall_seconds: 4.0704226000234485 (served from cache — not real training time)
+wall_seconds: 4.0704226000234485
 
 **Verdict: REJECTED**
 
@@ -199,7 +199,7 @@ wall_seconds: 4.0704226000234485 (served from cache — not real training time)
 
 **Error**: `contract` — NotImplementedError("executor.realize: no realization implemented for calibration impl 'duration_debias_cwm'")
 
-**Recovery**: {'message': 'move 6 (calibration/duration_debias_cwm) failed with contract; run continues to the next candidate.', 'policy': 'skip_unimplemented'}
+**Recovery** (policy=`skip_unimplemented`): move 6 (calibration/duration_debias_cwm) failed with contract; run continues to the next candidate.
 
 ---
 
@@ -214,7 +214,7 @@ wall_seconds: 4.0704226000234485 (served from cache — not real training time)
 
 **Error**: `contract` — NotImplementedError("executor.realize: no realization implemented for model impl 'lightgbm'")
 
-**Recovery**: {'message': 'move 7 (model/lightgbm) failed with contract; run continues to the next candidate.', 'policy': 'skip_unimplemented'}
+**Recovery** (policy=`skip_unimplemented`): move 7 (model/lightgbm) failed with contract; run continues to the next candidate.
 
 ---
 
@@ -265,7 +265,7 @@ wall_seconds: 0.0
 
 **Error**: `contract` — NotImplementedError("executor.realize: no realization implemented for calibration impl 'popularity_blend'")
 
-**Recovery**: {'message': 'move 9 (calibration/popularity_blend) failed with contract; run continues to the next candidate.', 'policy': 'skip_unimplemented'}
+**Recovery** (policy=`skip_unimplemented`): move 9 (calibration/popularity_blend) failed with contract; run continues to the next candidate.
 
 **Circuit breaker**: slot `calibration` blocked after 2 consecutive failures.
 
@@ -302,7 +302,7 @@ Backtest:
 | 1 | 0.6605 | 0.5169 | 0.5887 |
 | 2 | 0.6601 | 0.5167 | 0.5884 |
 
-wall_seconds: 17.664408000186086 (served from cache — not real training time)
+wall_seconds: 17.664408000186086
 
 **Verdict: REJECTED**
 
