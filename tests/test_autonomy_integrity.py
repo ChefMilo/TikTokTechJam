@@ -71,6 +71,12 @@ def source_tree(tmp_path):
     return tmp_path
 
 
+# EVERY test that calls run_controller.main() MUST pass --report-dir at a
+# tmp_path as well as --journal. Both default to real paths under
+# artifacts/, and main() always writes the autonomy section and (since
+# rendering became the default) the metric report — so a test that omits
+# --report-dir silently overwrites committed run evidence with stub-run
+# output, under a header naming a pytest tmp path.
 def _stub_training(monkeypatch, *, results=None):
     """Replace the real executor. See PR1's identical helper for why the
     patch target is the adapter's bound name, not executor.run's."""
@@ -604,7 +610,9 @@ def test_a_clean_run_logs_the_fingerprint_and_zero_interventions(
     journal_path = tmp_path / "journal.jsonl"
 
     exit_code = run_controller.main(
-        ["--max-nodes-per-stage", "1", "--journal", str(journal_path), "--run-id", "clean"]
+        ["--max-nodes-per-stage", "1", "--journal", str(journal_path),
+            "--report-dir", str(tmp_path / "report"),
+            "--run-id", "clean"]
     )
     assert exit_code == 0
 
@@ -636,7 +644,9 @@ def test_the_journal_and_the_monitor_agree_on_the_count(tmp_path, monkeypatch, c
     journal_path = tmp_path / "journal.jsonl"
 
     run_controller.main(
-        ["--max-nodes-per-stage", "1", "--journal", str(journal_path), "--run-id", "agree"]
+        ["--max-nodes-per-stage", "1", "--journal", str(journal_path),
+            "--report-dir", str(tmp_path / "report"),
+            "--run-id", "agree"]
     )
 
     summary = _run_end(journal_path, "agree").payload["run_metadata"]["integrity"]["summary"]
@@ -657,7 +667,9 @@ def test_relaunching_an_interrupted_run_without_resume_logs_one_intervention(
     journal.log_eval_start("cfg1", node=1)
 
     run_controller.main(
-        ["--max-nodes-per-stage", "1", "--journal", str(journal_path), "--run-id", "restarted"]
+        ["--max-nodes-per-stage", "1", "--journal", str(journal_path),
+            "--report-dir", str(tmp_path / "report"),
+            "--run-id", "restarted"]
     )
 
     logged = _interventions(journal_path, "restarted")
@@ -687,6 +699,7 @@ def test_relaunching_with_resume_over_identical_source_counts_nothing(
         [
             "--max-nodes-per-stage", "1",
             "--journal", str(journal_path),
+            "--report-dir", str(tmp_path / "report"),
             "--run-id", "resumed",
             "--resume",
         ]
@@ -714,10 +727,14 @@ def test_resume_after_a_prior_run_finished_cleanly_is_just_a_fresh_run(
     journal_path = tmp_path / "journal.jsonl"
 
     run_controller.main(
-        ["--max-nodes-per-stage", "1", "--journal", str(journal_path), "--run-id", "first"]
+        ["--max-nodes-per-stage", "1", "--journal", str(journal_path),
+            "--report-dir", str(tmp_path / "report"),
+            "--run-id", "first"]
     )
     run_controller.main(
-        ["--max-nodes-per-stage", "1", "--journal", str(journal_path), "--run-id", "second"]
+        ["--max-nodes-per-stage", "1", "--journal", str(journal_path),
+            "--report-dir", str(tmp_path / "report"),
+            "--run-id", "second"]
     )
 
     assert _interventions(journal_path, "second") == []
