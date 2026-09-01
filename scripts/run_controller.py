@@ -80,39 +80,48 @@ loop that may ask for more, and it terminates cleanly through FINALIZE
 and RUN_END rather than by crashing.
 
 
-KNOWN GAP: executor/report.py CANNOT RENDER A CONTROLLER JOURNAL YET
+REPORT RENDERING: ON BY DEFAULT (was opt-in)
 --------------------------------------------------------------------
-Rendering is therefore OPT-IN (`--report`), default off. This is a real
-incompatibility found while wiring this up, not a preference, and it is
-two separate payload-shape mismatches with the same root cause: the
-durable journal's `log_*` helpers and the Controller's own `_emit` write
-different payloads for the same EventKind, and executor/report.py was
-written against the helpers.
+executor/report.py now reads BOTH journal payload shapes, so rendering
+is the default and `--no-report` turns it off. What follows is why it
+was ever opt-in, and what the reconciliation did and did not fix —
+because one half is fixed and the other half is not a bug at all.
 
-  CONVERGENCE_CHECK — FATAL. Journal.log_convergence_check writes
-  {delta, epsilon, clears_epsilon, accept}; the Controller writes
+The two shapes: the durable journal's `log_*` helpers and the
+Controller's own `_emit` write different payloads for the same
+EventKind, and executor/report.py was originally written against the
+helpers only.
+
+  CONVERGENCE_CHECK — WAS FATAL, NOW FIXED. Journal.log_convergence_check
+  writes {delta, epsilon, clears_epsilon, accept}; the Controller writes
   {iteration_definition, converged, by_rule, organizers_converged,
   internal_converged, recent_deltas, recent_significant,
   iterations_considered, epsilon, n_required}. report.py's
-  `_format_convergence_check` does `f"{payload.get('delta'):+.5f}"`,
-  which raises TypeError on None. The render dies partway through
-  iterations.md.
+  `_format_convergence_check` used to do `f"{payload.get('delta'):+.5f}"`,
+  which raised TypeError on None and killed the render partway through
+  iterations.md. It now branches on `"delta" in payload` and formats the
+  Controller's multi-rule shape on its own terms.
 
-  EVAL_RESULT — cosmetic. Journal.log_eval_result writes `per_seed`;
-  the Controller writes {config_id, status, primary, wall_seconds,
-  gpu_seconds, tokens}. report.py reads per-seed metrics out of
-  `per_seed`, so every metric row would render `n/a` even if the crash
-  above were fixed.
+  EVAL_RESULT — NOT A BUG, AND STILL VISIBLE. Journal.log_eval_result
+  writes `per_seed`; the Controller writes {config_id, status, primary,
+  wall_seconds, gpu_seconds, tokens}. report.py's `_eval_result_metrics`
+  now reads both, so `primary` renders a REAL number from a Controller
+  journal (results.md's "Validation-best primary" and its delta vs the
+  official baseline, iterations.md's per-node primary, trajectory.csv's
+  val_primary column).
+
+  But GAUC and nDCG@5 still render `n/a` on a Controller journal, and
+  no change to report.py can fix that: the Controller's flat payload
+  does not CARRY GAUC or nDCG@5. `primary` is already its own
+  seed-blended mean (controller/controller.py's `_mean_primary`). Those
+  `n/a`s are missing data, not a rendering failure, and reading them as
+  a regression is the mistake this paragraph exists to prevent.
 
 Both payload shapes are correct for their authors — contracts.py is
 explicit that payload shape is "documented, not enforced" and varies by
-EventKind. They are simply not the same shape. Reconciling them means
-editing executor/report.py (Terry's file) or writing a W2-owned
-renderer; both are out of scope here. tests/test_run_controller.py pins
-both mismatches so this note cannot quietly outlive its cause.
-
-Pass --report anyway to see it fail, or to pick up whatever renders once
-the shapes are reconciled.
+EventKind. tests/test_run_controller.py pins the reconciled behaviour:
+that the render succeeds, that primary is real, and that GAUC/nDCG@5
+are `n/a` for the payload-content reason above.
 
 Usage:
     python scripts/run_controller.py
@@ -350,12 +359,23 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--report",
+        dest="report",
         action="store_true",
+        default=True,
         help=(
-            "also render executor.report into --report-dir. OFF BY DEFAULT: "
-            "executor/report.py cannot render a Controller-produced journal "
-            "today and raises TypeError on the CONVERGENCE_CHECK payload — "
-            "see this module's docstring for both mismatches"
+            "also render executor.report into --report-dir. ON BY DEFAULT: "
+            "executor/report.py now reads the Controller's payload shapes. "
+            "Kept as an explicit no-op opt-in so existing invocations that "
+            "pass it keep working — see --no-report to turn rendering off"
+        ),
+    )
+    parser.add_argument(
+        "--no-report",
+        dest="report",
+        action="store_false",
+        help=(
+            "skip the executor.report render. The autonomy section is "
+            "written either way; the two documents fail independently"
         ),
     )
     return parser.parse_args(argv)
@@ -559,11 +579,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"  report rendered to {report_dir}:")
         for path in sorted(report_dir.iterdir()):
             print(f"    {path.name} ({path.stat().st_size} bytes)")
+        print("    note: GAUC and nDCG@5 read n/a in results.md — the")
+        print("          Controller's EVAL_RESULT payload does not carry them;")
+        print("          primary is real. See this script's docstring.")
     else:
         print()
-        print("  report               = not rendered (--report is off by default;")
-        print("                         executor/report.py cannot render a Controller")
-        print("                         journal yet — see this script's docstring)")
+        print("  report               = not rendered (--no-report was passed;")
+        print("                         rendering is ON by default)")
 
     return 0
 

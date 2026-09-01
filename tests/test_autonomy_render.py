@@ -295,21 +295,46 @@ def test_render_autonomy_without_out_dir_writes_nothing(tmp_path, monkeypatch):
     assert not (tmp_path / "autonomy.md").exists()
 
 
-def test_the_autonomy_section_is_written_even_without_the_report_flag(
+def test_the_autonomy_section_is_written_even_with_rendering_turned_off(
     tmp_path, monkeypatch, capsys
 ):
     """It reads the journal directly, so it must not be hostage to
-    executor/report.py's unrelated rendering bug."""
+    executor/report.py at all — the two documents fail independently.
+
+    This used to be phrased as "without the report flag", back when
+    rendering was opt-in because report.py could not read a Controller
+    journal. Rendering is now ON by default, so the independence claim is
+    exercised through --no-report instead. The claim itself is unchanged.
+    """
+    _stub_training(monkeypatch)
+    _pretend_clean(monkeypatch)
+    _run(tmp_path, monkeypatch, "--no-report", run_id="clean")
+
+    assert (tmp_path / "report" / "autonomy.md").exists()
+    out = capsys.readouterr().out
+    assert "autonomy section" in out
+    # The metric report is the half that was switched off.
+    assert "not rendered" in out
+    assert not (tmp_path / "report" / "results.md").exists()
+
+
+def test_both_documents_are_written_on_the_default_path(
+    tmp_path, monkeypatch, capsys
+):
+    """The other side of the independence claim, and the new default:
+    with no flags at all, the autonomy section AND the metric report are
+    both produced."""
     _stub_training(monkeypatch)
     _pretend_clean(monkeypatch)
     _run(tmp_path, monkeypatch, run_id="clean")
 
     assert (tmp_path / "report" / "autonomy.md").exists()
+    assert (tmp_path / "report" / "results.md").exists()
+
     out = capsys.readouterr().out
     assert "autonomy section" in out
-    # The metric report stays gated.
-    assert "not rendered" in out
-    assert not (tmp_path / "report" / "results.md").exists()
+    assert "report rendered to" in out
+    assert "not rendered" not in out
 
 
 # ---------------------------------------------------------------------------

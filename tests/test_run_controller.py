@@ -63,9 +63,10 @@ def test_defaults_are_the_documented_ones():
     assert run_controller.parse_seeds(args.seeds) == (0, 1, 2)
     assert args.max_nodes_per_stage == 2
     assert args.failures_before_block == 2
-    # Rendering is opt-in: executor/report.py cannot render a
-    # Controller-produced journal yet. See the two pinning tests below.
-    assert args.report is False
+    # Rendering is ON by default: executor/report.py now reads the
+    # Controller's payload shapes. See the two tests at the bottom of
+    # this file for exactly what it does and does not render.
+    assert args.report is True
     assert args.run_id is None
 
 
@@ -250,7 +251,10 @@ def test_main_runs_and_journals_without_training(tmp_path, monkeypatch, capsys):
     assert "(clean finish)" in out
     # The elapsed figure is measured, never a constant.
     assert "elapsed" in out and "measured, not assumed" in out
-    assert "not rendered" in out
+    # Rendering is on by default, so the summary names the rendered
+    # files rather than explaining why there are none.
+    assert "report rendered to" in out
+    assert "not rendered" not in out
 
 
 def test_a_second_run_into_the_same_journal_stays_distinguishable(tmp_path, monkeypatch):
@@ -275,54 +279,117 @@ def test_a_second_run_into_the_same_journal_stays_distinguishable(tmp_path, monk
 
 
 # ---------------------------------------------------------------------------
-# Why --report is opt-in: two payload-shape mismatches, pinned
+# What --report renders now that report.py reads both payload shapes
+#
+# These two tests replace a pair that pinned the OLD incompatibility
+# (a TypeError, and every metric row reading `n/a`). report.py's
+# capability genuinely changed, so the expectation changed with it:
+# the render must now SUCCEED and carry real numbers. The second test
+# also pins the one thing the reconciliation did NOT fix, and cannot —
+# see its docstring.
 # ---------------------------------------------------------------------------
 
 
-def test_report_render_crashes_on_a_controller_convergence_check(tmp_path, monkeypatch):
-    """THE FATAL MISMATCH, pinned so the workaround cannot outlive it.
+def test_report_render_succeeds_on_a_controller_convergence_check(tmp_path, monkeypatch):
+    """THE FATAL MISMATCH, now fixed — pinned from the other side.
 
-    executor/report.py's `_format_convergence_check` formats
-    `payload["delta"]`, which Journal.log_convergence_check writes and the
-    Controller does not — the Controller's CONVERGENCE_CHECK payload
-    carries {converged, by_rule, recent_deltas, epsilon, n_required, ...}
-    instead. Formatting None with `:+.5f` raises TypeError.
+    The Controller's CONVERGENCE_CHECK payload still carries
+    {converged, by_rule, recent_deltas, epsilon, n_required, ...} and
+    still has no `delta` key: the payload did not change, report.py did.
+    `_format_convergence_check` now branches on the shape instead of
+    formatting a missing `delta` with `:+.5f` and dying on the None.
 
-    When report.py learns to read both shapes, this test fails and
-    scripts/run_controller.py can make --report the default.
+    So this asserts the same payload facts as before, and then that the
+    render completes and puts the Controller's own convergence vocabulary
+    into iterations.md.
     """
     from executor.report import render
 
     _stub_training(monkeypatch)
     journal_path = tmp_path / "journal_controller.jsonl"
     run_controller.main(
-        ["--max-nodes-per-stage", "1", "--journal", str(journal_path), "--run-id", "r"]
+        ["--max-nodes-per-stage", "1", "--journal", str(journal_path), "--run-id", "r",
+         "--report-dir", str(tmp_path / "rundir")]
     )
 
     replayed = Journal.replay(str(journal_path))
     convergence = [e for e in replayed if e.kind.value == "convergence_check"]
     assert convergence, "the run produced no CONVERGENCE_CHECK to characterise"
+    # Unchanged: the Controller payload is what it always was.
     assert "delta" not in convergence[0].payload
     assert "clears_epsilon" not in convergence[0].payload
     assert "epsilon" in convergence[0].payload
 
-    with pytest.raises(TypeError, match="NoneType"):
-        render(str(journal_path), output_dir=str(tmp_path / "report"))
+    # Changed: this no longer raises TypeError.
+    out_dir = tmp_path / "report"
+    render(str(journal_path), output_dir=str(out_dir))
+
+    # The render ran to completion rather than dying partway through
+    # iterations.md, so every document exists.
+    written = {path.name for path in out_dir.iterdir()}
+    assert {"results.md", "iterations.md", "trajectory.csv"} <= written
+
+    iterations = (out_dir / "iterations.md").read_text(encoding="utf-8")
+    assert "**Convergence check**" in iterations
+    # Formatted from the Controller's own keys, not the helper's.
+    assert "epsilon=" in iterations
+    assert "recent_deltas=[" in iterations
+    assert "iterations_considered=" in iterations
 
 
-def test_controller_eval_result_lacks_the_per_seed_key_report_reads(tmp_path, monkeypatch):
-    """THE COSMETIC MISMATCH. Even with the crash above fixed, every
-    metric row would render `n/a`: report.py's `_mean_across_seeds` reads
-    `payload["per_seed"]`, which only Journal.log_eval_result writes."""
+def test_controller_eval_result_renders_a_real_primary_but_no_gauc_or_ndcg(
+    tmp_path, monkeypatch
+):
+    """THE COSMETIC MISMATCH — half fixed, half not fixable, and the
+    difference matters when reading results.md.
+
+    FIXED: report.py's `_eval_result_metrics` reads both shapes, so
+    `primary` comes off the Controller's flat payload and renders as a
+    real number everywhere it appears.
+
+    NOT FIXED, AND NOT FIXABLE IN report.py: GAUC and nDCG@5 still read
+    `n/a`, because the Controller's EVAL_RESULT payload does not CARRY
+    them — it writes {config_id, status, primary, wall_seconds,
+    gpu_seconds, tokens} and nothing else, and `primary` is already its
+    own seed-blended mean. Those `n/a`s are missing data, not a broken
+    renderer. This test pins that distinction so nobody 'fixes'
+    report.py chasing them, and so the day the Controller starts
+    emitting per-metric values this test fails and says so.
+    """
+    from executor.report import render
+
     _stub_training(monkeypatch)
     journal_path = tmp_path / "journal_controller.jsonl"
     run_controller.main(
-        ["--max-nodes-per-stage", "1", "--journal", str(journal_path), "--run-id", "r"]
+        ["--max-nodes-per-stage", "1", "--journal", str(journal_path), "--run-id", "r",
+         "--report-dir", str(tmp_path / "rundir")]
     )
 
+    # Unchanged: the payload is still the flat Controller shape.
     results = [e for e in Journal.replay(str(journal_path)) if e.kind.value == "eval_result"]
     assert results
     assert "per_seed" not in results[0].payload
     assert {"config_id", "status", "primary", "wall_seconds", "gpu_seconds", "tokens"} <= set(
         results[0].payload
     )
+    assert "GAUC" not in str(results[0].payload)
+
+    out_dir = tmp_path / "report"
+    render(str(journal_path), output_dir=str(out_dir))
+    text = (out_dir / "results.md").read_text(encoding="utf-8")
+
+    # The stub evaluates every candidate at primary 0.60, so the
+    # best-primary row is a real number and its delta against the
+    # official baseline (0.6016) is computed, not skipped.
+    assert "| Validation-best primary | 0.6000 |" in text
+    assert "| Validation-best primary | n/a |" not in text
+    assert "Delta vs official baseline primary (0.6016) | -0.0016 |" in text
+
+    # ...and the two the payload does not carry are still n/a.
+    assert "| Validation-best GAUC | n/a |" in text
+    assert "| Validation-best nDCG@5 | n/a |" in text
+
+    # The same real primary reaches the per-node narrative and the CSV.
+    assert "primary: 0.6000" in (out_dir / "iterations.md").read_text(encoding="utf-8")
+    csv_text = (out_dir / "trajectory.csv").read_text(encoding="utf-8")
+    assert "0.600000" in csv_text
